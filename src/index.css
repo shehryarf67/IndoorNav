@@ -1,0 +1,59 @@
+@import 'tailwindcss';
+
+/*
+ * Design tokens for MallNav.
+ *
+ * The palette is deliberately restrained: a light neutral UI so that the only
+ * saturated colour on screen is data — routes, signal strength, position
+ * estimates. On a projector in a defence room, that contrast is what makes the
+ * demo readable from the back row.
+ */
+@theme {
+  --color-ink: #0f172a;
+  --color-ink-soft: #475569;
+  --color-ink-faint: #94a3b8;
+  --color-line: #e2e8f0;
+  --color-surface: #ffffff;
+  --color-canvas: #f8fafc;
+
+  /* Semantic data colours, referenced by name in every tab so the legends
+     stay consistent across the three prototypes. */
+  --color-brand: #2563eb; /* the "blue dot" / estimated position */
+  --color-truth: #0f172a; /* ground truth position */
+  --color-route: #2563eb; /* computed shortest path */
+  --color-node: #6366f1; /* navigation graph nodes */
+  --color-ap: #7c3aed; /* Wi-Fi access points */
+  --color-good: #16a34a; /* accurate / fingerprinting */
+  --color-warn: #f59e0b; /* QR anchors */
+  --color-bad: #dc2626; /* poor accuracy / trilateration */
+
+  --font-sans:
+    'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, monospace;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-feature-settings: 'cv05', 'ss01';
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Tabular figures everywhere we show a measurement, so numbers don't jitter
+   as they animate. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Utility: a hairline card used for every panel in the app. */
+@utility card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  border-radius: 0.75rem;
+}
