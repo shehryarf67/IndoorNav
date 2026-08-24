@@ -50,6 +50,14 @@ src/
   lib/
     navGraph.js     Derives the navigation graph from the corridor geometry, and
                     searches it with A*. (Tab 1)
+    wifi.js         The positioning engine: propagation model, radio-map
+                    generation, weighted-kNN fingerprinting, least-squares
+                    trilateration, batch evaluation. (Tabs 2 and 3)
+    signalColor.js  The two sequential colour ramps — signal strength in dBm,
+                    positioning error in metres — with their legend thresholds.
+    fusion.js       The confidence ladder: the walking route, QR anchors, the
+                    dead-reckoning error model, and the per-tick fusion step
+                    that layers all four methods. (Tab 3)
   components/
     FloorPlanSvg.jsx   The one SVG renderer used by all three tabs. Each tab
                        passes its own overlay as children.
@@ -89,3 +97,54 @@ forces the lift and visibly lengthens the route.
 Seven Wi-Fi access points per level sit along the corridors, where a mall's IT
 contractor actually puts them. Their positions are intentionally not symmetric,
 which is what creates the weak coverage zones that Tab 2's error map exposes.
+
+## Headline results
+
+Measured by the app itself, not quoted from anywhere. Reproducible — every
+random sequence in the project is seeded.
+
+**Tab 1 — map digitization**
+
+| | |
+| --- | --- |
+| Graph derivation | ~0.15 ms for both floors (75 nodes, 76 edges) |
+| Equivalent manual tracing | ~70 min (35 min per floor) |
+| A* efficiency | examines ~26 of 75 nodes to prove a route optimal |
+| Accessibility cost | Khaadi → Cinepax: 46 m via escalator, 86 m step-free via lift |
+
+**Tab 2 — positioning accuracy** (400 random positions across both levels)
+
+| Metric | Fingerprinting | Trilateration |
+| --- | --- | --- |
+| Mean error | **1.74 m** | 14.9 m |
+| Median error | 1.42 m | 16.6 m |
+| 90th percentile | 3.40 m | 25.7 m |
+| Within 3 m | 85.8% | 10.2% |
+| Within 5 m | 97.8% | 19.6% |
+| Correct floor | 100% | cannot determine |
+| No solution produced | 0 | 38 (9.5%) |
+
+Radio map: 640 reference points at 1.5 m spacing in ~35 ms, versus ~16 hours of
+walking a manual site survey.
+
+Under model mismatch — the radio map still built on n = 2.8 and 6.5 dB per wall
+while reality is n = 3.4, 10 dB per wall and +6 dB of crowd absorption —
+fingerprinting degrades from 1.74 m to 5.82 m. Degraded, but still usable. That
+is the honest limitation of a predicted map, and the sliders let a panel push on
+it live.
+
+**Tab 3 — fusion** (mean error over the 68 m route, averaged across 12 seeds)
+
+| Layers active | Mean error | Final error |
+| --- | --- | --- |
+| All four | **1.1 m** | 1.2 m |
+| Dead reckoning + Wi-Fi | 1.0 m | 1.4 m |
+| Dead reckoning + QR | 1.9 m | 1.3 m |
+| Dead reckoning only | 5.4 m | 13.1 m, on the wrong floor |
+| Wi-Fi + map matching | 5.6 m | 6.4 m (the dot lags the walker) |
+
+Two findings worth pointing at during a defence: dead reckoning alone ends up on
+the **wrong floor**, because a step counter cannot feel an escalator; and Wi-Fi
+alone is accurate but too slow to drive a smooth dot, so it visibly trails
+behind. Neither is fixable within a single method — which is the argument for the
+ladder.
