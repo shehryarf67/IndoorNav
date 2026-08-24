@@ -4,16 +4,21 @@ import { buildRadioMap, DEFAULT_SPACING_M, MAP_MODEL } from '../lib/wifi.js';
 import {
   WALK_ROUTE,
   QR_ANCHORS,
-  WIFI_INTERVAL_S,
   QR_RADIUS_M,
   STRIDE_M,
+  SENSOR_ERROR,
+  WIFI_SCAN_PRESETS,
+  DEFAULT_WIFI_INTERVAL_S,
   buildWalkPlan,
+  buildFusionContext,
   initFusionState,
   stepFusion,
   scanQrCode,
+  setManualPosition,
   confidenceLabel,
   noLayersActive,
 } from '../lib/fusion.js';
+import { PF_CONFIG } from '../lib/particleFilter.js';
 import FloorPlanSvg from '../components/FloorPlanSvg.jsx';
 import ExplainerPanel from '../components/ExplainerPanel.jsx';
 import { Panel, Button, Toggle, Stat, Badge } from '../components/ui.jsx';
@@ -22,10 +27,13 @@ import { Panel, Button, Toggle, Stat, Badge } from '../components/ui.jsx';
  * TAB 3 — Positioning Fusion
  *
  * The "blue dot that doesn't walk through walls" story. A simulated shopper
- * walks a fixed route across both levels; the estimated position is driven by
- * four independently switchable layers. Turning layers off makes each one's
- * contribution visible, and dead-reckoning-alone drifts badly enough to make
- * the argument for layering by itself.
+ * walks a route across both levels; position is estimated by a particle filter
+ * whose four operations correspond exactly to the four togglable layers.
+ *
+ * Everything on screen that claims to be the app's own knowledge is computed
+ * without reference to the true position. The true position appears only in the
+ * clearly-labelled evaluation readouts, because this is a simulation and we can
+ * afford to grade ourselves.
  */
 
 /** Simulation tick, in milliseconds of wall-clock time. */
@@ -34,13 +42,16 @@ const TICK_MS = 100;
 /** Playback speeds offered to the presenter. */
 const SPEEDS = [1, 2, 4];
 
+/** Draw at most this many particles, for render cost. */
+const MAX_DRAWN_PARTICLES = 220;
+
 /**
  * Preset layer combinations, for a fast A/B during a live demo.
  *
- * Every preset leaves QR available. That is not an oversight: since a scan only
- * happens when the user presses the button, having anchors switched on costs the
- * comparison nothing — and it means the recovery story stays demonstrable even
- * in the presets built to show the system failing.
+ * Every preset leaves QR available. Since a scan only happens when the user
+ * presses the button, having anchors switched on costs the comparison nothing —
+ * and it keeps the recovery story demonstrable in the presets built to show the
+ * system failing.
  */
 const PRESETS = [
   {
@@ -50,22 +61,22 @@ const PRESETS = [
     hint: 'the product: one entrance scan, then the phone',
   },
   {
+    id: 'nomap',
+    label: 'No map matching',
+    layers: { dr: true, qr: true, wifi: true, mapMatch: false },
+    hint: 'what the floor plan was contributing',
+  },
+  {
     id: 'nowifi',
     label: 'No Wi-Fi',
     layers: { dr: true, qr: true, wifi: false, mapMatch: true },
-    hint: 'drift with nothing to correct it — then scan to recover',
+    hint: 'drift with no radio correction — and the floor is never recovered',
   },
   {
     id: 'dr',
     label: 'Dead reckoning alone',
     layers: { dr: true, qr: true, wifi: false, mapMatch: false },
-    hint: 'drifts through walls and onto the wrong floor',
-  },
-  {
-    id: 'wifi',
-    label: 'Wi-Fi only',
-    layers: { dr: false, qr: true, wifi: true, mapMatch: true },
-    hint: 'accurate but laggy — the dot trails the walker',
+    hint: 'raw sensors: drifts through walls and onto the wrong floor',
   },
 ];
 
@@ -76,52 +87,57 @@ export default function FusionTab() {
   const [manualLevel, setManualLevel] = useState(1);
   const [autoFollow, setAutoFollow] = useState(true);
   const [manualMode, setManualMode] = useState(false);
+  const [showParticles, setShowParticles] = useState(true);
+  const [wifiIntervalS, setWifiIntervalS] = useState(DEFAULT_WIFI_INTERVAL_S);
 
-  // The radio map is needed for the Wi-Fi layer. It is built once, on mount,
-  // with the same predicted-map approach demonstrated in Tab 2.
+  // The radio map is needed for the Wi-Fi layer, built once with the same
+  // predicted-map approach demonstrated in Tab 2.
   const radioMap = useMemo(
     () => buildRadioMap(LEVELS, ALL_APS, DEFAULT_SPACING_M, MAP_MODEL),
     [],
   );
   const plan = useMemo(() => buildWalkPlan(), []);
-  const ctx = useMemo(
-    () => ({ radioMap, aps: ALL_APS, levels: LEVELS }),
-    [radioMap],
-  );
+  const ctx = useMemo(() => buildFusionContext(radioMap, ALL_APS, LEVELS), [radioMap]);
 
-  const [state, setState] = useState(() => initFusionState(plan, 7, { qr: true }));
+  const [state, setState] = useState(() => initFusionState(plan, 7, { qr: true }, ctx));
 
   /**
-   * Which floor is on screen.
-   *
-   * Derived during render rather than pushed into state by an effect: while
-   * `autoFollow` is on, this is simply "wherever the shopper is", so the view
-   * can never fall out of sync with the simulation. Picking a floor by hand
-   * turns following off and uses the manual choice instead.
+   * Which floor is on screen. Derived during render rather than pushed into
+   * state by an effect, so the view can never fall out of sync with the
+   * simulation.
    */
   const levelNo = autoFollow ? state.truth.level : manualLevel;
 
-  // Layers are read inside the interval callback, so keep them in a ref. This
-  // lets a toggle take effect on the very next tick without tearing down and
-  // restarting the timer, which would visibly stutter the walk.
+  // Layers and scan interval are read inside the interval callback, so keep them
+  // in refs — a toggle then takes effect on the next tick without tearing down
+  // and restarting the timer, which would visibly stutter the walk.
   const layersRef = useRef(layers);
+  const intervalRef = useRef(wifiIntervalS);
   useEffect(() => {
     layersRef.current = layers;
   }, [layers]);
+  useEffect(() => {
+    intervalRef.current = wifiIntervalS;
+  }, [wifiIntervalS]);
 
   // ---- The simulation loop ------------------------------------------------
   //
-  // A fixed-interval timer rather than requestAnimationFrame: the physics here
-  // is a fixed-timestep integration, and a steady 100 ms tick keeps the drift
+  // A fixed-interval timer rather than requestAnimationFrame: this is a
+  // fixed-timestep integration, and a steady tick keeps the sensor errors
   // reproducible instead of varying with the display's refresh rate.
   useEffect(() => {
     if (!running) return;
     const id = setInterval(() => {
       setState((prev) => {
         if (prev.finished) return prev;
-        const next = stepFusion(prev, (TICK_MS / 1000) * speed, plan, layersRef.current, ctx);
-        // Stop the clock when the shopper arrives. Doing it here rather than in
-        // an effect keeps it a consequence of the tick that ended the walk.
+        const next = stepFusion(
+          prev,
+          (TICK_MS / 1000) * speed,
+          plan,
+          layersRef.current,
+          ctx,
+          intervalRef.current,
+        );
         if (next.finished) setRunning(false);
         return next;
       });
@@ -131,15 +147,11 @@ export default function FusionTab() {
 
   const reset = useCallback(() => {
     setRunning(false);
-    // The bootstrap fix depends on whether QR is available at all, so the
-    // current layer settings decide how the walk starts.
-    setState(initFusionState(plan, 7, layersRef.current));
+    setState(initFusionState(plan, 7, layersRef.current, ctx));
     setManualLevel(1);
-  }, [plan]);
+  }, [plan, ctx]);
 
-  const applyPreset = useCallback((preset) => {
-    setLayers(preset.layers);
-  }, []);
+  const applyPreset = useCallback((preset) => setLayers(preset.layers), []);
 
   /** The user deliberately scans a QR code — the recovery action. */
   const handleScan = useCallback(() => {
@@ -150,18 +162,7 @@ export default function FusionTab() {
   const handleMapClick = useCallback(
     (p) => {
       if (!manualMode) return;
-      setState((prev) => ({
-        ...prev,
-        est: { x: p.x, y: p.y, level: levelNo },
-        headingBias: 0,
-        metresSinceFix: 0,
-        lastCorrection: 'Manual selection by user',
-        flash: { text: 'Position set manually', t: prev.t },
-        events: [
-          { type: 'manual', text: 'User tapped their own position', t: prev.t },
-          ...prev.events,
-        ].slice(0, 8),
-      }));
+      setState((prev) => setManualPosition(prev, p, levelNo));
       setManualMode(false);
     },
     [manualMode, levelNo],
@@ -169,7 +170,8 @@ export default function FusionTab() {
 
   const level = getLevel(levelNo);
   const allOff = noLayersActive(layers);
-  const confidence = confidenceLabel(state.currentError, state.wrongFloor);
+  // Confidence comes from the filter's OWN spread, not from the true error.
+  const confidence = confidenceLabel(state.spreadM, state.floorConfidence);
   const meanError = state.errorCount ? state.errorSum / state.errorCount : 0;
   const progress = plan.totalSeconds ? state.t / plan.totalSeconds : 0;
 
@@ -181,67 +183,90 @@ export default function FusionTab() {
       p.layers.mapMatch === layers.mapMatch,
   );
 
+  // Thin the cloud for rendering — 400 SVG circles per tick is wasteful and the
+  // shape of the cloud is just as readable from half of them.
+  const drawnParticles = useMemo(() => {
+    if (!showParticles || !state.particles) return [];
+    const stride = Math.max(1, Math.ceil(state.particles.length / MAX_DRAWN_PARTICLES));
+    return state.particles.filter((p, i) => i % stride === 0 && p.level === levelNo);
+  }, [showParticles, state.particles, levelNo]);
+
   return (
     <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_380px]">
       {/* ================= MAP COLUMN ================= */}
       <div className="space-y-4">
-        {/* ---- Live confidence readout ---- */}
+        {/* ---- Confidence vs actual error ---- */}
         <div className="rounded-xl border border-line bg-surface p-4">
           <div className="flex flex-wrap items-end justify-between gap-4">
-            <div>
-              <div className="text-[10px] font-bold uppercase tracking-[0.08em] text-ink-faint">
-                Current error — horizontal
-              </div>
-              <div className="mt-0.5 flex items-baseline gap-3">
-                <span
-                  className={`tnum text-3xl font-semibold leading-none ${
-                    confidence.tone === 'good'
-                      ? 'text-good'
-                      : confidence.tone === 'warn'
-                        ? 'text-amber-600'
-                        : 'text-bad'
-                  }`}
-                >
-                  {state.currentError.toFixed(2)}
-                  <span className="ml-1 text-base font-medium text-ink-soft">m</span>
-                </span>
-                <Badge
-                  tone={
-                    confidence.tone === 'good' ? 'good' : confidence.tone === 'warn' ? 'warn' : 'bad'
-                  }
-                >
-                  {confidence.text}
-                </Badge>
-              </div>
-              {/* The floor is reported separately from the distance, never
-                  folded into it. Being 0.7 m out on the wrong level is not
-                  0.7 m of accuracy, and one combined number would hide that. */}
-              <p className="mt-1 text-[11px] text-ink-soft">
-                {state.wrongFloor ? (
-                  <span className="font-medium text-bad">
-                    Horizontal distance only — the estimate is on{' '}
-                    {getLevel(state.est.level).name}, not {getLevel(state.truth.level).name}
+            <div className="flex flex-wrap items-end gap-6">
+              {/* What the app itself believes — no ground truth involved. */}
+              <div>
+                <div className="text-[10px] font-bold uppercase tracking-[0.08em] text-ink-faint">
+                  App&rsquo;s own confidence
+                </div>
+                <div className="mt-0.5 flex items-baseline gap-2">
+                  <span className="tnum text-3xl font-semibold leading-none text-brand">
+                    ±{state.spreadM.toFixed(2)}
+                    <span className="ml-1 text-base font-medium text-ink-soft">m</span>
                   </span>
-                ) : (
-                  <>
-                    Floor correct ·{' '}
-                    <span className="text-ink-faint">
-                      distance is in the horizontal plane
-                    </span>
-                  </>
+                  <Badge
+                    tone={
+                      confidence.tone === 'good'
+                        ? 'good'
+                        : confidence.tone === 'warn'
+                          ? 'warn'
+                          : 'bad'
+                    }
+                  >
+                    {confidence.text}
+                  </Badge>
+                </div>
+                <p className="mt-1 text-[11px] text-ink-soft">
+                  Spread of the {PF_CONFIG.count}-particle cloud — computed{' '}
+                  <strong className="text-ink">without</strong> knowing the true position
+                </p>
+                {/* A torn cloud is a different failure from a fuzzy one, and the
+                    product would respond differently: ask for a QR scan rather
+                    than just widen the circle. */}
+                {state.modeShare !== undefined && state.modeShare < 0.6 && (
+                  <p className="mt-1 text-[11px] font-medium text-amber-700">
+                    Torn between separate locations — only{' '}
+                    {(state.modeShare * 100).toFixed(0)}% of hypotheses agree on this one
+                  </p>
                 )}
-              </p>
-              <p className="mt-0.5 text-[11px] text-ink-soft">
-                Last correction: <strong className="text-ink">{state.lastCorrection}</strong>
-              </p>
+              </div>
+
+              {/* The grade. Only available because this is a simulation. */}
+              <div className="border-l border-line pl-6">
+                <div className="text-[10px] font-bold uppercase tracking-[0.08em] text-ink-faint">
+                  Actual error (simulation only)
+                </div>
+                <div className="mt-0.5 flex items-baseline gap-2">
+                  <span
+                    className={`tnum text-3xl font-semibold leading-none ${
+                      state.wrongFloor
+                        ? 'text-bad'
+                        : state.currentError < 5
+                          ? 'text-good'
+                          : 'text-amber-600'
+                    }`}
+                  >
+                    {state.currentError.toFixed(2)}
+                    <span className="ml-1 text-base font-medium text-ink-soft">m</span>
+                  </span>
+                  {state.wrongFloor && <Badge tone="bad">wrong floor</Badge>}
+                </div>
+                <p className="mt-1 text-[11px] text-ink-soft">
+                  Horizontal distance to ground truth — a real app can never see this
+                </p>
+              </div>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
               <Button onClick={() => setRunning((r) => !r)} disabled={state.finished}>
                 {running ? 'Pause walk' : state.t > 0 ? 'Resume walk' : 'Start walk'}
               </Button>
-              {/* Scanning is a user action, so it is a button — never automatic.
-                  It is only offered when a code is actually within reach. */}
+              {/* Scanning is a user action, so it is a button — never automatic. */}
               <Button
                 variant={state.qrInRange ? 'primary' : 'secondary'}
                 onClick={handleScan}
@@ -252,7 +277,7 @@ export default function FusionTab() {
                     : 'No QR code within reach right now'
                 }
               >
-                {state.qrInRange ? 'Scan QR code ✓ in reach' : 'Scan QR code'}
+                {state.qrInRange ? 'Scan QR ✓ in reach' : 'Scan QR code'}
               </Button>
               <Button variant="secondary" onClick={reset}>
                 Reset
@@ -274,6 +299,10 @@ export default function FusionTab() {
             </div>
           </div>
 
+          <p className="mt-2 text-[11px] text-ink-soft">
+            Last correction: <strong className="text-ink">{state.lastCorrection}</strong>
+          </p>
+
           {/* Walk progress */}
           <div className="mt-3">
             <div className="h-1.5 overflow-hidden rounded-full bg-canvas">
@@ -285,7 +314,7 @@ export default function FusionTab() {
             <div className="mt-1 flex justify-between text-[11px] text-ink-faint">
               <span className="tnum">
                 {state.t.toFixed(0)} s of {plan.totalSeconds.toFixed(0)} s ·{' '}
-                {Math.round(state.stepCount)} steps counted
+                {Math.round(state.stepCount)} steps counted · {state.scanCount} Wi-Fi scans
               </span>
               <span>
                 {state.truth.riding
@@ -340,14 +369,11 @@ export default function FusionTab() {
         {/* ---- Warnings ---- */}
         {allOff && (
           <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs leading-relaxed text-red-900">
-            <strong>Every layer is off.</strong> The estimate is frozen wherever it was last
+            <strong>Every layer is off.</strong> The particle cloud is frozen where it was last
             corrected — this is what an indoor navigation app looks like with no positioning at
-            all. The only thing left is the manual fallback below.
+            all. Only the manual fallback is left.
           </div>
         )}
-        {/* Prompt the recovery action exactly when it is worth taking. This is
-            the moment QR anchors justify themselves: not as a passive beacon,
-            but as the thing that rescues a dot the phone has lost. */}
         {state.qrInRange && state.currentError > 4 && (
           <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-900">
             <span>
@@ -360,10 +386,16 @@ export default function FusionTab() {
         )}
         {state.wrongFloor && (
           <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-900">
-            <strong>The estimate is on the wrong floor</strong> — it thinks you are on{' '}
+            <strong>The estimate is on the wrong floor</strong> — it believes{' '}
             {getLevel(state.est.level).name} while you are on {getLevel(state.truth.level).name}. A
-            step counter cannot feel an escalator. Only a QR scan or a Wi-Fi fix can resolve the
-            floor.
+            step counter cannot feel an escalator, so only a Wi-Fi scan or a QR scan resolves this.
+            {layers.wifi && (
+              <>
+                {' '}
+                The next scan is due within {wifiIntervalS} s and should trigger a
+                re-localisation.
+              </>
+            )}
           </div>
         )}
 
@@ -401,8 +433,6 @@ export default function FusionTab() {
               <g style={{ pointerEvents: 'none' }}>
                 {QR_ANCHORS.filter((a) => a.level === levelNo).map((a) => {
                   const scanned = state.scannedAnchorIds.includes(a.id);
-                  // "In reach" is an affordance, not an event: the code can be
-                  // scanned right now if the user chooses to.
                   const inReach = state.qrInRange?.id === a.id;
                   return (
                     <g key={a.id}>
@@ -436,7 +466,6 @@ export default function FusionTab() {
                         strokeWidth={1.5}
                         vectorEffect="non-scaling-stroke"
                       />
-                      {/* A tiny QR-like glyph, so the marker reads as a printed code. */}
                       <g fill="#78350f" opacity={scanned && !inReach ? 0.4 : 0.9}>
                         <rect x={a.x - 0.75} y={a.y - 0.75} width={0.5} height={0.5} />
                         <rect x={a.x + 0.25} y={a.y - 0.75} width={0.5} height={0.5} />
@@ -461,11 +490,20 @@ export default function FusionTab() {
               </g>
             )}
 
-            {/* --- Trails: where each dot has actually been --- */}
+            {/* --- Trails --- */}
             <g style={{ pointerEvents: 'none' }}>
               <TrailPath trail={state.trueTrail} level={levelNo} color="#0f172a" width={2} />
               <TrailPath trail={state.estTrail} level={levelNo} color="#2563eb" width={2} dashed />
             </g>
+
+            {/* --- The particle cloud: the estimator's actual internal state --- */}
+            {drawnParticles.length > 0 && (
+              <g style={{ pointerEvents: 'none' }}>
+                {drawnParticles.map((p, i) => (
+                  <circle key={i} cx={p.x} cy={p.y} r={0.22} fill="#2563eb" opacity={0.35} />
+                ))}
+              </g>
+            )}
 
             {/* --- Error line between truth and estimate --- */}
             {state.est.level === levelNo && state.truth.level === levelNo && (
@@ -485,14 +523,25 @@ export default function FusionTab() {
             {/* --- The estimated position: the "blue dot" --- */}
             {state.est.level === levelNo && (
               <g style={{ pointerEvents: 'none' }}>
-                {/* The halo encodes uncertainty: it grows with the current error,
-                    which is exactly how a real app communicates confidence. */}
+                {/* The halo is the filter's 1-sigma spread — a self-assessed
+                    confidence, not a peek at the true error. */}
                 <circle
                   cx={state.est.x}
                   cy={state.est.y}
-                  r={Math.max(1.5, Math.min(12, state.currentError))}
+                  r={Math.max(1, Math.min(20, state.spreadM))}
                   fill="#2563eb"
-                  opacity={0.15}
+                  opacity={0.14}
+                />
+                <circle
+                  cx={state.est.x}
+                  cy={state.est.y}
+                  r={Math.max(1, Math.min(20, state.spreadM))}
+                  fill="none"
+                  stroke="#2563eb"
+                  strokeWidth={1}
+                  strokeDasharray="2 2"
+                  opacity={0.5}
+                  vectorEffect="non-scaling-stroke"
                 />
                 <circle
                   cx={state.est.x}
@@ -508,32 +557,30 @@ export default function FusionTab() {
 
             {/* --- The true position --- */}
             {state.truth.level === levelNo && (
-              <g style={{ pointerEvents: 'none' }}>
-                <circle
-                  cx={state.truth.x}
-                  cy={state.truth.y}
-                  r={1}
-                  fill="#0f172a"
-                  stroke="#ffffff"
-                  strokeWidth={2}
-                  vectorEffect="non-scaling-stroke"
-                />
-              </g>
+              <circle
+                cx={state.truth.x}
+                cy={state.truth.y}
+                r={1}
+                fill="#0f172a"
+                stroke="#ffffff"
+                strokeWidth={2}
+                vectorEffect="non-scaling-stroke"
+                style={{ pointerEvents: 'none' }}
+              />
             )}
 
-            {/* --- QR flash --- */}
+            {/* --- Flash --- */}
             {state.flash && (
               <g style={{ pointerEvents: 'none' }}>
-                <rect
-                  x={12}
-                  y={1.5}
-                  width={36}
-                  height={4.4}
-                  rx={0.8}
-                  fill="#b45309"
-                  opacity={0.95}
-                />
-                <text x={30} y={4.6} textAnchor="middle" fontSize={1.9} fill="#ffffff" fontWeight={600}>
+                <rect x={12} y={1.5} width={36} height={4.4} rx={0.8} fill="#b45309" opacity={0.95} />
+                <text
+                  x={30}
+                  y={4.6}
+                  textAnchor="middle"
+                  fontSize={1.9}
+                  fill="#ffffff"
+                  fontWeight={600}
+                >
                   {state.flash.text}
                 </text>
               </g>
@@ -544,26 +591,19 @@ export default function FusionTab() {
           <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1.5 border-t border-line pt-3 text-[11px]">
             <LegendItem color="#0f172a" label="True position (ground truth)" />
             <LegendItem color="#2563eb" label="Estimated position — the blue dot" />
+            <LegendItem color="#2563eb" label="Particle cloud (the filter's hypotheses)" faint />
             <LegendItem color="#2563eb" label="Estimate's path" dashed />
             <LegendItem color="#0f172a" label="Actual path walked" solid />
-            <LegendItem color="#f59e0b" label="QR anchor (square = code, ring = scan range)" />
+            <LegendItem color="#f59e0b" label="QR anchor (ring = scan range)" />
             <LegendItem color="#cbd5e1" label="Planned route" solid />
-            <span className="text-ink-soft">
-              Blue halo = current uncertainty (grows with error)
-            </span>
+            <span className="text-ink-soft">Dashed circle = 1σ self-assessed uncertainty</span>
           </div>
         </div>
 
         {/* ---- Session statistics ---- */}
-        <Panel title="This walk" subtitle="Accuracy accumulated since the last reset">
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-            <Stat
-              label="Mean error"
-              value={meanError.toFixed(2)}
-              unit="m"
-              hint="horizontal"
-            />
-            {/* Floor accuracy is its own metric, exactly as in Tab 2. */}
+        <Panel title="This walk" subtitle="Accumulated since the last reset">
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+            <Stat label="Mean error" value={meanError.toFixed(2)} unit="m" hint="horizontal" />
             <Stat
               label="Floor correct"
               value={
@@ -584,8 +624,20 @@ export default function FusionTab() {
               tone="bad"
               hint="horizontal"
             />
-            {/* Scans are a COST, not coverage: every one is an interruption the
-                user had to perform. One is the target. */}
+            {/* The thesis of this tab, as one number. A real app can compute
+                this itself — it holds the floor plan. */}
+            <Stat
+              label="Dot inside a wall"
+              value={
+                state.errorCount
+                  ? (((state.wallViolationCount ?? 0) / state.errorCount) * 100).toFixed(0)
+                  : '0'
+              }
+              unit="%"
+              tone={(state.wallViolationCount ?? 0) === 0 ? 'good' : 'bad'}
+              hint="of the walk"
+            />
+            {/* Scans are a COST, not coverage: each is an interruption. */}
             <Stat
               label="QR scans used"
               value={state.qrScanCount}
@@ -634,31 +686,42 @@ export default function FusionTab() {
       <div className="space-y-4">
         <ExplainerPanel
           title="Positioning Fusion — what am I looking at?"
-          whatThisIs="A shopper walking a route across two levels, with the app's estimate of their position running alongside the truth so you can see exactly where it goes wrong."
+          whatThisIs="A shopper walking across two levels, with the app's position estimate running alongside the truth so you can see exactly where and why it goes wrong."
           concept={[
-            'The real product never relies on one sensor, because every indoor positioning method has a different failure mode. So they are layered into a confidence ladder: the most trustworthy source available wins, and the others fill the gaps between.',
-            'QR anchors are the top rung — a printed code encodes its own exact coordinates, so scanning one gives ground truth and resets all accumulated drift to zero. But scanning is something the user has to do: take the phone out, open the camera, aim it. So the design target is exactly ONE scan, at the entrance directory board where they are already choosing a destination. From that moment the phone is on its own, and re-scanning exists only as a recovery option if the dot goes obviously wrong.',
-            'Dead reckoning carries the dot between those moments. It counts steps and reads a heading, which is smooth and instant, but every small error in stride length or compass heading is permanent — so error grows without bound. Turn everything else off and watch it wander into the shops.',
-            'Wi-Fi fingerprinting corrects that drift with a bounded ~2 m fix every few seconds, and it is the only layer that can tell which floor you are on. But it is too slow and too noisy to drive a smooth dot alone — with only Wi-Fi the dot visibly lags behind the walker.',
-            'Map matching contributes no position at all. It only knows where you cannot be, and pushes the estimate back onto walkable floor. Note its limit: it corrects error across the corridor but is blind to error along it.',
+            'No indoor positioning method is trustworthy alone, and they fail in different situations — so the product layers them. The estimator is a particle filter: instead of one guessed position it holds a cloud of a few hundred guesses, each carrying its own hypothesis about how wrong the phone’s compass and step length are.',
+            'Each of the four layers below is one operation on that cloud. Dead reckoning moves every particle by its own hypothesis, so the cloud spreads as fast as the sensors are untrustworthy. Map matching deletes particles that walked through a wall. Wi-Fi re-weights particles by how well each one’s expected fingerprint matches what was heard. A QR scan collapses the whole cloud onto a known point.',
+            'The reason map matching is powerful rather than cosmetic: deleting particles that ended up somewhere impossible is deleting wrong hypotheses about the compass. So after a corner, only particles whose compass guess was roughly right survive — the filter learns the sensor error from the shape of the building, and corrects drift ALONG a corridor, not just across it.',
+            'The blue halo is the spread of the surviving cloud. That is the app’s genuine self-assessed confidence: it is computed from the particles alone and never looks at the true position. Compare it against the "actual error" readout to see how honest the filter is being.',
           ]}
           legend={[
             {
               kind: 'dot',
               color: '#0f172a',
               label: 'True position',
-              desc: 'black dot — where the shopper actually is. In reality the app never knows this; it is here so you can judge the estimate',
+              desc: 'black dot — where the shopper actually is. A real app never knows this; it is here so you can grade the estimate',
             },
             {
               kind: 'halo',
               color: '#2563eb',
               label: 'Estimated position (the blue dot)',
-              desc: 'what the app believes. Its halo grows with the current uncertainty',
+              desc: 'the weighted mean of the particle cloud — what the app believes',
+            },
+            {
+              kind: 'dot',
+              color: '#93c5fd',
+              label: 'Particle cloud',
+              desc: `${PF_CONFIG.count} weighted hypotheses (a sample is drawn). Tight cloud = confident; spread out = uncertain`,
+            },
+            {
+              kind: 'ring',
+              color: '#2563eb',
+              label: '1σ uncertainty circle',
+              desc: 'the spread of the cloud — the app’s own confidence, derived without any access to ground truth',
             },
             {
               kind: 'thin-line',
               color: '#0f172a',
-              label: "Actual path walked",
+              label: 'Actual path walked',
               desc: 'solid dark trail — ground truth history',
             },
             {
@@ -672,63 +735,59 @@ export default function FusionTab() {
               color: '#f59e0b',
               color2: '#b45309',
               label: 'QR anchor',
-              desc: `a printed code on a pillar. Its ring brightens and reads “scannable” when you are within ${QR_RADIUS_M} m — but nothing happens until you press Scan, because scanning is the user's decision`,
+              desc: `a printed code on a pillar. Its ring brightens and reads "scannable" within ${QR_RADIUS_M} m — but nothing happens until you press Scan, because scanning is the user's decision`,
             },
             {
               kind: 'line',
               color: '#cbd5e1',
               label: 'Planned route',
-              desc: 'the path the simulated shopper follows — west entrance, escalator, then Metro Shoes on Level 2',
+              desc: 'west entrance, escalator, then Metro Shoes on Level 2',
             },
             {
               kind: 'dot',
               color: '#7c3aed',
               label: 'Wi-Fi access points',
-              desc: 'shown while the Wi-Fi layer is on — fixes are computed from the same predicted radio map as Tab 2',
-            },
-            {
-              kind: 'dashed',
-              color: '#94a3b8',
-              label: 'Error line',
-              desc: 'the gap between truth and estimate — its length is the number in the readout above',
+              desc: 'shown while the Wi-Fi layer is on — fixes come from the same predicted radio map as Tab 2',
             },
           ]}
-          whyItMatters="A blue dot that drifts into a shop or lands on the wrong floor destroys trust in the whole app — so MallNav's real contribution is not any single positioning method, it is the fallback ladder that keeps the dot believable when individual sensors fail."
-          footnote={`Layer parameters: stride ${STRIDE_M} m with a 6% systematic scale error plus gyro heading drift as a random walk; Wi-Fi fixes every ${WIFI_INTERVAL_S} s blended at 45% toward the fingerprint match; QR scan radius ${QR_RADIUS_M} m; map matching projects onto the corridor rectangles defined in the shared floor plan. Averaged over 12 random seeds on this 68 m route: with all layers on ≈ 1.03 m mean error achieved from a SINGLE entrance scan, versus ≈ 5.4 m mean drifting to ≈ 13 m and the wrong floor when dead reckoning runs alone. Note that "all layers on" and "no QR after the entrance" measure identically — the entrance scan is the starting gun, not a contributor. QR anchors earn their place on the recovery path, which is why re-scanning is a button rather than something that happens to you.`}
+          whyItMatters="A blue dot that drifts into a shop or sits on the wrong floor destroys trust in the whole app — so MallNav's real contribution is not any single positioning method, it is the layered estimator that keeps the dot believable when individual sensors fail."
+          footnote={`Simulated sensor errors (the filter never sees these numbers, only the corrupted measurements): assumed stride ${STRIDE_M} m against a true step-length estimate ${((SENSOR_ERROR.strideScaleBias - 1) * 100).toFixed(0)}% long, compass error random-walking at ${SENSOR_ERROR.compassDriftPerStep} rad per √step. These are calibrated so UNAIDED dead reckoning accumulates 8–12% of distance travelled as error, which is mid-range for published phone-grade pedestrian dead reckoning (typically 5–15%). Wi-Fi scan interval defaults to 30 s because Android 9+ throttles a foreground app to 4 scans per 2 minutes — most demos assume one scan a second and thereby hide how far the phone must coast between corrections. All figures are simulated: no real RSSI, IMU or floor plan measurements are used anywhere in this project.`}
         />
 
         {/* ---- Layer toggles ---- */}
-        <Panel title="Positioning layers" subtitle="Switch each one off to see what it was doing">
+        <Panel
+          title="Positioning layers"
+          subtitle="Each one is a single operation on the particle cloud"
+        >
           <div className="space-y-3.5">
             <Toggle
               checked={layers.qr}
               onChange={(v) => setLayers((l) => ({ ...l, qr: v }))}
-              label="1 · QR anchors — exact truth, on demand"
+              label="1 · QR anchors — collapse the cloud"
               accent="warn"
-              hint={`Printed codes at ${QR_ANCHORS.length} points. One scan at the entrance starts the session; after that use the Scan button only if the dot looks wrong. A scan places you at the code's own coordinates, so any residual error is simply how far you are standing from it — at most the ${QR_RADIUS_M} m scan range. Weakness: it needs the user to stop and aim a camera, so it can never be the everyday mechanism.`}
+              hint={`One scan at the entrance starts the session; after that use the Scan button only if the dot looks wrong. A scan places you at the code's own coordinates, so residual error is how far you stand from it — at most ${QR_RADIUS_M} m. Weakness: it needs the user to stop and aim a camera, so it can never be the everyday mechanism.`}
             />
             <Toggle
               checked={layers.dr}
               onChange={(v) => setLayers((l) => ({ ...l, dr: v }))}
-              label="2 · Dead reckoning — carries you between fixes"
-              hint="Step count × stride length, in the direction the compass reports. Weakness: errors accumulate forever, and it cannot sense a floor change."
+              label="2 · Dead reckoning — propagate"
+              hint="Moves each particle by step count × its own stride hypothesis, along the compass heading plus its own error hypothesis. Weakness: error accumulates without bound, and a step counter cannot feel a floor change."
             />
             <Toggle
               checked={layers.wifi}
               onChange={(v) => setLayers((l) => ({ ...l, wifi: v }))}
-              label="3 · Wi-Fi fingerprinting — corrects drift"
+              label="3 · Wi-Fi fingerprinting — re-weight"
               accent="ap"
-              hint={`A fix every ${WIFI_INTERVAL_S} s from the predicted radio map, pulling the estimate back. Also resolves which floor you are on. Weakness: noisy and slow — it lags a walker.`}
+              hint="Scores every particle against the predicted radio map and resamples. If no particle can explain the reading at all, the filter admits it is lost and re-localises from scratch — which is how it recovers the floor after the escalator."
             />
             <Toggle
               checked={layers.mapMatch}
               onChange={(v) => setLayers((l) => ({ ...l, mapMatch: v }))}
-              label="4 · Map matching — stops walls being crossed"
+              label="4 · Map matching — delete the impossible"
               accent="good"
-              hint="Constrains the estimate to walkable corridors. Weakness: it can only fix error across the corridor, never along it."
+              hint="Deletes any particle that is inside a wall or crossed one to get there. Because a particle's position encodes its own error hypotheses, this implicitly deletes wrong compass guesses — so it fixes along-corridor drift too."
             />
 
-            {/* The always-works fallback. */}
             <div className="border-t border-line pt-3">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
@@ -749,14 +808,51 @@ export default function FusionTab() {
           </div>
         </Panel>
 
+        {/* ---- Realism controls ---- */}
+        <Panel title="Wi-Fi scan interval" subtitle="A real platform constraint, not a tuning knob">
+          <div className="inline-flex rounded-lg border border-line p-0.5">
+            {WIFI_SCAN_PRESETS.map((p) => (
+              <button
+                key={p.id}
+                type="button"
+                onClick={() => setWifiIntervalS(p.seconds)}
+                className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+                  p.seconds === wifiIntervalS
+                    ? 'bg-brand text-white'
+                    : 'text-ink-soft hover:text-ink'
+                }`}
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
+          <p className="mt-2 text-[11px] leading-relaxed text-ink-soft">
+            {WIFI_SCAN_PRESETS.find((p) => p.seconds === wifiIntervalS)?.note}. Since Android 9 a
+            foreground app gets 4 scans per 2 minutes — about one every 30 s. At that rate the
+            phone must coast{' '}
+            <strong className="tnum text-ink">
+              {(wifiIntervalS * 1.3).toFixed(0)} m
+            </strong>{' '}
+            on dead reckoning between corrections, which is why the other layers have to be good.
+          </p>
+        </Panel>
+
         {/* ---- View options ---- */}
         <Panel title="View">
-          <Toggle
-            checked={autoFollow}
-            onChange={setAutoFollow}
-            label="Follow the shopper between levels"
-            hint="Automatically switches the displayed floor when the route changes level. Turn off to stay on one floor and watch the estimate get left behind."
-          />
+          <div className="space-y-3">
+            <Toggle
+              checked={showParticles}
+              onChange={setShowParticles}
+              label="Show the particle cloud"
+              hint="Draws a sample of the filter's individual hypotheses. Watch it stretch along a corridor as drift accumulates, then snap tight after a Wi-Fi scan."
+            />
+            <Toggle
+              checked={autoFollow}
+              onChange={setAutoFollow}
+              label="Follow the shopper between levels"
+              hint="Switches the displayed floor when the route changes level. Turn off to stay on one floor and watch the estimate get left behind."
+            />
+          </div>
         </Panel>
       </div>
     </div>
@@ -767,10 +863,7 @@ export default function FusionTab() {
 // Sub-components
 // ---------------------------------------------------------------------------
 
-/**
- * Draw a trail, split wherever it changes level so a Level 2 segment never
- * draws a stray line across the Level 1 plan.
- */
+/** Draw a trail, split wherever it changes level. */
 function TrailPath({ trail, level, color, width, dashed = false }) {
   const runs = useMemo(() => {
     const out = [];
@@ -806,7 +899,7 @@ function TrailPath({ trail, level, color, width, dashed = false }) {
 }
 
 /** One entry in the map legend strip. */
-function LegendItem({ color, label, dashed = false, solid = false }) {
+function LegendItem({ color, label, dashed = false, solid = false, faint = false }) {
   return (
     <span className="flex items-center gap-1.5 text-ink-soft">
       {dashed || solid ? (
@@ -824,7 +917,7 @@ function LegendItem({ color, label, dashed = false, solid = false }) {
       ) : (
         <span
           className="inline-block h-2.5 w-2.5 rounded-full"
-          style={{ background: color }}
+          style={{ background: color, opacity: faint ? 0.4 : 1 }}
         />
       )}
       {label}
