@@ -100,9 +100,13 @@ export const WALK_ROUTE = [
  * Printed QR codes on pillars and doorways. Scanning one is the only source in
  * the whole system that gives exact truth — which is why they are placed where
  * Tab 2's error map showed accuracy is weakest.
+ *
+ * The first entry is the entrance directory board. That is the one code the user
+ * scans as a matter of course, because it is where they pick their destination;
+ * the rest exist purely as recovery points if the dot goes wrong.
  */
 export const QR_ANCHORS = [
-  { id: 'qr-1', level: 1, x: 5, y: 20, label: 'West entrance' },
+  { id: 'qr-1', level: 1, x: 5, y: 20, label: 'Entrance directory board' },
   { id: 'qr-2', level: 1, x: 17, y: 20, label: 'Concourse pillar' },
   { id: 'qr-3', level: 1, x: 30, y: 20, label: 'Central atrium' },
   { id: 'qr-4', level: 2, x: 30, y: 20, label: 'Level 2 atrium' },
@@ -192,11 +196,19 @@ export function samplePlan(plan, t) {
 
 /**
  * Fresh simulation state, positioned at the start of the route.
- * The estimate begins exactly on truth: every method needs somewhere to start,
- * and in the real app that initial fix comes from the entrance QR code.
+ *
+ * Every positioning system needs a bootstrap fix — somewhere to start counting
+ * from. In MallNav that is the QR code on the directory board at the entrance:
+ * the user scans it once to begin navigating, which is a natural thing to do
+ * anyway because that is where they choose their destination.
+ *
+ * THAT SCAN IS THE ONLY ONE THE SYSTEM ASSUMES. Everything after it is the
+ * phone's own work. With QR switched off there is no bootstrap at all, so the
+ * app starts from an assumed position and has to earn its way to the truth.
  */
-export function initFusionState(plan, seed = 7) {
+export function initFusionState(plan, seed = 7, layers = { qr: true }) {
   const truth = samplePlan(plan, 0);
+  const bootstrapped = !!layers.qr;
   return {
     t: 0,
     truth,
@@ -207,9 +219,15 @@ export function initFusionState(plan, seed = 7) {
     metresSinceFix: 0,
     stepCount: 0,
     lastWifiT: -Infinity,
-    scannedAnchorIds: [],
+    scannedAnchorIds: bootstrapped ? [QR_ANCHORS[0].id] : [],
+    /** How many QR codes the user has had to scan. Fewer is better. */
+    qrScanCount: bootstrapped ? 1 : 0,
+    /** The anchor currently within scanning reach, if any. */
+    qrInRange: null,
     /** Recent events, newest first, for the on-screen activity log. */
-    events: [],
+    events: bootstrapped
+      ? [{ type: 'qr', text: `Scanned "${QR_ANCHORS[0].label}" to start navigating`, t: 0 }]
+      : [],
     /** Flash message shown briefly over the map. */
     flash: null,
     trueTrail: [{ x: truth.x, y: truth.y, level: truth.level }],
@@ -217,12 +235,77 @@ export function initFusionState(plan, seed = 7) {
     errorSum: 0,
     errorCount: 0,
     maxError: 0,
+    /**
+     * HORIZONTAL error in metres. Reported separately from the floor decision,
+     * following the convention in the indoor-positioning literature (and
+     * matching Tab 2): a 2-D error figure plus a floor-detection rate. Blending
+     * them into one number would hide the failure that matters most — being
+     * sub-metre accurate on the wrong level is not sub-metre accuracy.
+     */
     currentError: 0,
     wrongFloor: false,
-    lastCorrection: 'Initial fix (entrance QR)',
+    /** Ticks spent on the correct floor, for the floor-accuracy readout. */
+    floorCorrectCount: 0,
+    lastCorrection: bootstrapped
+      ? 'Entrance QR scan (the one scan)'
+      : 'Assumed start — no QR bootstrap',
     rng: makeRng(seed),
     finished: false,
   };
+}
+
+/**
+ * Scan a QR code — a deliberate action the user takes, not an automatic event.
+ *
+ * This is the recovery path: the user glances at the map, sees the blue dot is
+ * somewhere they are plainly not, and scans the nearest code to fix it. It only
+ * works if a code is actually within reach, which is exactly the limitation of
+ * the method — perfect accuracy, but only where infrastructure happens to be
+ * and only when the user bothers.
+ *
+ * @param {object} state current simulation state
+ * @param {{qr: boolean}} layers
+ * @returns {object} new state
+ */
+export function scanQrCode(state, layers) {
+  if (!layers.qr) return state;
+
+  const anchor = state.qrInRange;
+
+  // A failed scan is worth showing: it is what happens when someone tries to
+  // recover in the middle of a corridor with no code on any nearby pillar.
+  if (!anchor) {
+    const miss = { ...state, events: state.events };
+    miss.flash = { text: 'No QR code within reach', t: state.t };
+    pushEvent(miss, 'qr', 'Scan attempted — no QR code within reach');
+    return miss;
+  }
+
+  const s = {
+    ...state,
+    est: { x: anchor.x, y: anchor.y, level: anchor.level },
+    headingBias: 0,
+    metresSinceFix: 0,
+    qrScanCount: state.qrScanCount + 1,
+    scannedAnchorIds: state.scannedAnchorIds.includes(anchor.id)
+      ? state.scannedAnchorIds
+      : [...state.scannedAnchorIds, anchor.id],
+    lastCorrection: `QR re-scan: ${anchor.label}`,
+    flash: { text: `QR scanned — position corrected (${anchor.label})`, t: state.t },
+    events: state.events,
+  };
+
+  // The estimate is now exactly on a known point. Note the residual error does
+  // not go to zero: the code encodes ITS OWN coordinates, so scanning places you
+  // where the code is, and whatever gap remains is simply how far you are
+  // standing from it — bounded by QR_RADIUS_M. Snapping to the true position
+  // instead would be cheating, and would overstate what a QR anchor delivers.
+  s.currentError = dist(s.truth, s.est);
+  s.wrongFloor = s.est.level !== s.truth.level;
+  s.estTrail = [...state.estTrail, { x: anchor.x, y: anchor.y, level: anchor.level }];
+  pushEvent(s, 'qr', `QR "${anchor.label}" re-scanned — drift reset to zero`);
+
+  return s;
 }
 
 /**
@@ -314,24 +397,25 @@ export function stepFusion(state, dt, plan, layers, ctx) {
   // ---- Layer 1 (highest confidence): QR anchors --------------------------
   //
   // A printed code encodes its own exact coordinates, so scanning one is ground
-  // truth. Drift resets to zero. This is the cheapest possible infrastructure —
-  // a sticker on a pillar — and the most accurate thing in the whole system.
-  if (layers.qr) {
+  // truth and resets drift to zero. It is the cheapest infrastructure in the
+  // system — a sticker on a pillar — and the most accurate thing in it.
+  //
+  // But scanning is a DELIBERATE USER ACTION, not a beacon. The user has to
+  // take their phone out, open the camera and aim it. Nobody does that five
+  // times on the way to a shop. So this layer deliberately does NOT fire on
+  // proximity: it fires once at the entrance to start the session, and after
+  // that only when the user chooses to re-scan because the dot looks wrong.
+  //
+  // All a tick does is work out whether a code is currently within reach, so
+  // the interface can offer the option. The scan itself is `scanQrCode()`.
+  s.qrInRange = null;
+  if (layers.qr && !s.truth.riding) {
     for (const anchor of QR_ANCHORS) {
       if (anchor.level !== s.truth.level) continue;
-      if (s.scannedAnchorIds.includes(anchor.id)) continue;
-      if (dist(s.truth, anchor) > QR_RADIUS_M) continue;
-
-      s.est.x = anchor.x;
-      s.est.y = anchor.y;
-      s.est.level = anchor.level;
-      s.headingBias = 0;
-      s.metresSinceFix = 0;
-      s.scannedAnchorIds = [...s.scannedAnchorIds, anchor.id];
-      s.flash = { text: `QR scanned — position corrected (${anchor.label})`, t: s.t };
-      s.lastCorrection = `QR anchor: ${anchor.label}`;
-      pushEvent(s, 'qr', `QR "${anchor.label}" scanned — drift reset to zero`);
-      break;
+      if (dist(s.truth, anchor) <= QR_RADIUS_M) {
+        s.qrInRange = anchor;
+        break;
+      }
     }
   }
 
@@ -356,6 +440,7 @@ export function stepFusion(state, dt, plan, layers, ctx) {
   s.errorSum += s.currentError;
   s.errorCount += 1;
   s.maxError = Math.max(s.maxError, s.currentError);
+  if (!s.wrongFloor) s.floorCorrectCount = (state.floorCorrectCount ?? 0) + 1;
 
   // Trails, thinned so they stay cheap to render over a 60-second walk.
   s.trueTrail = appendTrail(state.trueTrail, s.truth);

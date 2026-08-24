@@ -10,6 +10,7 @@ import {
   buildWalkPlan,
   initFusionState,
   stepFusion,
+  scanQrCode,
   confidenceLabel,
   noLayersActive,
 } from '../lib/fusion.js';
@@ -33,25 +34,38 @@ const TICK_MS = 100;
 /** Playback speeds offered to the presenter. */
 const SPEEDS = [1, 2, 4];
 
-/** Preset layer combinations, for a fast A/B during a live demo. */
+/**
+ * Preset layer combinations, for a fast A/B during a live demo.
+ *
+ * Every preset leaves QR available. That is not an oversight: since a scan only
+ * happens when the user presses the button, having anchors switched on costs the
+ * comparison nothing — and it means the recovery story stays demonstrable even
+ * in the presets built to show the system failing.
+ */
 const PRESETS = [
   {
     id: 'all',
     label: 'All layers on',
     layers: { dr: true, qr: true, wifi: true, mapMatch: true },
-    hint: 'the product',
+    hint: 'the product: one entrance scan, then the phone',
+  },
+  {
+    id: 'nowifi',
+    label: 'No Wi-Fi',
+    layers: { dr: true, qr: true, wifi: false, mapMatch: true },
+    hint: 'drift with nothing to correct it — then scan to recover',
   },
   {
     id: 'dr',
-    label: 'Dead reckoning only',
-    layers: { dr: true, qr: false, wifi: false, mapMatch: false },
-    hint: 'watch it drift',
+    label: 'Dead reckoning alone',
+    layers: { dr: true, qr: true, wifi: false, mapMatch: false },
+    hint: 'drifts through walls and onto the wrong floor',
   },
   {
     id: 'wifi',
     label: 'Wi-Fi only',
-    layers: { dr: false, qr: false, wifi: true, mapMatch: true },
-    hint: 'accurate but laggy',
+    layers: { dr: false, qr: true, wifi: true, mapMatch: true },
+    hint: 'accurate but laggy — the dot trails the walker',
   },
 ];
 
@@ -75,7 +89,7 @@ export default function FusionTab() {
     [radioMap],
   );
 
-  const [state, setState] = useState(() => initFusionState(plan));
+  const [state, setState] = useState(() => initFusionState(plan, 7, { qr: true }));
 
   /**
    * Which floor is on screen.
@@ -117,12 +131,19 @@ export default function FusionTab() {
 
   const reset = useCallback(() => {
     setRunning(false);
-    setState(initFusionState(plan));
+    // The bootstrap fix depends on whether QR is available at all, so the
+    // current layer settings decide how the walk starts.
+    setState(initFusionState(plan, 7, layersRef.current));
     setManualLevel(1);
   }, [plan]);
 
   const applyPreset = useCallback((preset) => {
     setLayers(preset.layers);
+  }, []);
+
+  /** The user deliberately scans a QR code — the recovery action. */
+  const handleScan = useCallback(() => {
+    setState((prev) => scanQrCode(prev, layersRef.current));
   }, []);
 
   /** Manual selection — the always-works fallback. */
@@ -169,7 +190,7 @@ export default function FusionTab() {
           <div className="flex flex-wrap items-end justify-between gap-4">
             <div>
               <div className="text-[10px] font-bold uppercase tracking-[0.08em] text-ink-faint">
-                Current positioning error
+                Current error — horizontal
               </div>
               <div className="mt-0.5 flex items-baseline gap-3">
                 <span
@@ -192,7 +213,25 @@ export default function FusionTab() {
                   {confidence.text}
                 </Badge>
               </div>
+              {/* The floor is reported separately from the distance, never
+                  folded into it. Being 0.7 m out on the wrong level is not
+                  0.7 m of accuracy, and one combined number would hide that. */}
               <p className="mt-1 text-[11px] text-ink-soft">
+                {state.wrongFloor ? (
+                  <span className="font-medium text-bad">
+                    Horizontal distance only — the estimate is on{' '}
+                    {getLevel(state.est.level).name}, not {getLevel(state.truth.level).name}
+                  </span>
+                ) : (
+                  <>
+                    Floor correct ·{' '}
+                    <span className="text-ink-faint">
+                      distance is in the horizontal plane
+                    </span>
+                  </>
+                )}
+              </p>
+              <p className="mt-0.5 text-[11px] text-ink-soft">
                 Last correction: <strong className="text-ink">{state.lastCorrection}</strong>
               </p>
             </div>
@@ -200,6 +239,20 @@ export default function FusionTab() {
             <div className="flex flex-wrap items-center gap-2">
               <Button onClick={() => setRunning((r) => !r)} disabled={state.finished}>
                 {running ? 'Pause walk' : state.t > 0 ? 'Resume walk' : 'Start walk'}
+              </Button>
+              {/* Scanning is a user action, so it is a button — never automatic.
+                  It is only offered when a code is actually within reach. */}
+              <Button
+                variant={state.qrInRange ? 'primary' : 'secondary'}
+                onClick={handleScan}
+                disabled={!layers.qr}
+                title={
+                  state.qrInRange
+                    ? `Scan "${state.qrInRange.label}"`
+                    : 'No QR code within reach right now'
+                }
+              >
+                {state.qrInRange ? 'Scan QR code ✓ in reach' : 'Scan QR code'}
               </Button>
               <Button variant="secondary" onClick={reset}>
                 Reset
@@ -292,6 +345,19 @@ export default function FusionTab() {
             all. The only thing left is the manual fallback below.
           </div>
         )}
+        {/* Prompt the recovery action exactly when it is worth taking. This is
+            the moment QR anchors justify themselves: not as a passive beacon,
+            but as the thing that rescues a dot the phone has lost. */}
+        {state.qrInRange && state.currentError > 4 && (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-900">
+            <span>
+              The dot is <strong className="tnum">{state.currentError.toFixed(1)} m</strong> out and{' '}
+              <strong>{state.qrInRange.label}</strong> is within reach — this is when a user would
+              notice and re-scan.
+            </span>
+            <Button onClick={handleScan}>Scan to recover</Button>
+          </div>
+        )}
         {state.wrongFloor && (
           <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-900">
             <strong>The estimate is on the wrong floor</strong> — it thinks you are on{' '}
@@ -335,6 +401,9 @@ export default function FusionTab() {
               <g style={{ pointerEvents: 'none' }}>
                 {QR_ANCHORS.filter((a) => a.level === levelNo).map((a) => {
                   const scanned = state.scannedAnchorIds.includes(a.id);
+                  // "In reach" is an affordance, not an event: the code can be
+                  // scanned right now if the user chooses to.
+                  const inReach = state.qrInRange?.id === a.id;
                   return (
                     <g key={a.id}>
                       <circle
@@ -342,26 +411,50 @@ export default function FusionTab() {
                         cy={a.y}
                         r={QR_RADIUS_M}
                         fill="#f59e0b"
-                        opacity={scanned ? 0.08 : 0.14}
+                        opacity={inReach ? 0.3 : scanned ? 0.07 : 0.12}
                       />
+                      {inReach && (
+                        <circle
+                          cx={a.x}
+                          cy={a.y}
+                          r={QR_RADIUS_M}
+                          fill="none"
+                          stroke="#b45309"
+                          strokeWidth={2}
+                          strokeDasharray="3 2"
+                          vectorEffect="non-scaling-stroke"
+                        />
+                      )}
                       <rect
                         x={a.x - 1.1}
                         y={a.y - 1.1}
                         width={2.2}
                         height={2.2}
                         rx={0.3}
-                        fill={scanned ? '#fed7aa' : '#f59e0b'}
+                        fill={scanned && !inReach ? '#fed7aa' : '#f59e0b'}
                         stroke="#b45309"
                         strokeWidth={1.5}
                         vectorEffect="non-scaling-stroke"
                       />
                       {/* A tiny QR-like glyph, so the marker reads as a printed code. */}
-                      <g fill="#78350f" opacity={scanned ? 0.4 : 0.9}>
+                      <g fill="#78350f" opacity={scanned && !inReach ? 0.4 : 0.9}>
                         <rect x={a.x - 0.75} y={a.y - 0.75} width={0.5} height={0.5} />
                         <rect x={a.x + 0.25} y={a.y - 0.75} width={0.5} height={0.5} />
                         <rect x={a.x - 0.75} y={a.y + 0.25} width={0.5} height={0.5} />
                         <rect x={a.x + 0.25} y={a.y + 0.25} width={0.5} height={0.5} />
                       </g>
+                      {inReach && (
+                        <text
+                          x={a.x}
+                          y={a.y - QR_RADIUS_M - 0.8}
+                          textAnchor="middle"
+                          fontSize={1.3}
+                          fontWeight={700}
+                          fill="#b45309"
+                        >
+                          scannable
+                        </text>
+                      )}
                     </g>
                   );
                 })}
@@ -465,17 +558,45 @@ export default function FusionTab() {
         <Panel title="This walk" subtitle="Accuracy accumulated since the last reset">
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
             <Stat
-              label="Current error"
-              value={state.currentError.toFixed(2)}
+              label="Mean error"
+              value={meanError.toFixed(2)}
               unit="m"
-              tone={confidence.tone === 'good' ? 'good' : 'bad'}
+              hint="horizontal"
             />
-            <Stat label="Mean error" value={meanError.toFixed(2)} unit="m" />
-            <Stat label="Worst error" value={state.maxError.toFixed(2)} unit="m" tone="bad" />
+            {/* Floor accuracy is its own metric, exactly as in Tab 2. */}
             <Stat
-              label="QR anchors scanned"
-              value={`${state.scannedAnchorIds.length} / ${QR_ANCHORS.length}`}
-              hint={layers.qr ? 'layer active' : 'layer off'}
+              label="Floor correct"
+              value={
+                state.errorCount
+                  ? ((state.floorCorrectCount / state.errorCount) * 100).toFixed(0)
+                  : '100'
+              }
+              unit="%"
+              tone={
+                state.errorCount && state.floorCorrectCount === state.errorCount ? 'good' : 'bad'
+              }
+              hint="of the walk"
+            />
+            <Stat
+              label="Worst error"
+              value={state.maxError.toFixed(2)}
+              unit="m"
+              tone="bad"
+              hint="horizontal"
+            />
+            {/* Scans are a COST, not coverage: every one is an interruption the
+                user had to perform. One is the target. */}
+            <Stat
+              label="QR scans used"
+              value={state.qrScanCount}
+              tone={state.qrScanCount <= 1 ? 'good' : 'default'}
+              hint={
+                state.qrScanCount === 0
+                  ? 'no bootstrap — QR off'
+                  : state.qrScanCount === 1
+                    ? 'just the entrance scan'
+                    : `${state.qrScanCount - 1} re-scan${state.qrScanCount > 2 ? 's' : ''} to recover`
+              }
             />
           </div>
 
@@ -516,7 +637,7 @@ export default function FusionTab() {
           whatThisIs="A shopper walking a route across two levels, with the app's estimate of their position running alongside the truth so you can see exactly where it goes wrong."
           concept={[
             'The real product never relies on one sensor, because every indoor positioning method has a different failure mode. So they are layered into a confidence ladder: the most trustworthy source available wins, and the others fill the gaps between.',
-            'QR anchors are the top rung — a printed code encodes its own exact coordinates, so scanning one gives ground truth and resets all accumulated drift to zero. But you only get one when you happen to walk past a pillar.',
+            'QR anchors are the top rung — a printed code encodes its own exact coordinates, so scanning one gives ground truth and resets all accumulated drift to zero. But scanning is something the user has to do: take the phone out, open the camera, aim it. So the design target is exactly ONE scan, at the entrance directory board where they are already choosing a destination. From that moment the phone is on its own, and re-scanning exists only as a recovery option if the dot goes obviously wrong.',
             'Dead reckoning carries the dot between those moments. It counts steps and reads a heading, which is smooth and instant, but every small error in stride length or compass heading is permanent — so error grows without bound. Turn everything else off and watch it wander into the shops.',
             'Wi-Fi fingerprinting corrects that drift with a bounded ~2 m fix every few seconds, and it is the only layer that can tell which floor you are on. But it is too slow and too noisy to drive a smooth dot alone — with only Wi-Fi the dot visibly lags behind the walker.',
             'Map matching contributes no position at all. It only knows where you cannot be, and pushes the estimate back onto walkable floor. Note its limit: it corrects error across the corridor but is blind to error along it.',
@@ -551,7 +672,7 @@ export default function FusionTab() {
               color: '#f59e0b',
               color2: '#b45309',
               label: 'QR anchor',
-              desc: `a printed code on a pillar. Pass within ${QR_RADIUS_M} m and it snaps the estimate to exact truth; it fades once used`,
+              desc: `a printed code on a pillar. Its ring brightens and reads “scannable” when you are within ${QR_RADIUS_M} m — but nothing happens until you press Scan, because scanning is the user's decision`,
             },
             {
               kind: 'line',
@@ -573,7 +694,7 @@ export default function FusionTab() {
             },
           ]}
           whyItMatters="A blue dot that drifts into a shop or lands on the wrong floor destroys trust in the whole app — so MallNav's real contribution is not any single positioning method, it is the fallback ladder that keeps the dot believable when individual sensors fail."
-          footnote={`Layer parameters: stride ${STRIDE_M} m with a 6% systematic scale error plus gyro heading drift as a random walk; Wi-Fi fixes every ${WIFI_INTERVAL_S} s blended at 45% toward the fingerprint match; QR scan radius ${QR_RADIUS_M} m; map matching projects onto the corridor rectangles defined in the shared floor plan. Averaged over 12 random seeds on this route: all layers on ≈ 1.1 m mean error, dead reckoning alone ≈ 5.4 m mean drifting to ≈ 13 m by the end.`}
+          footnote={`Layer parameters: stride ${STRIDE_M} m with a 6% systematic scale error plus gyro heading drift as a random walk; Wi-Fi fixes every ${WIFI_INTERVAL_S} s blended at 45% toward the fingerprint match; QR scan radius ${QR_RADIUS_M} m; map matching projects onto the corridor rectangles defined in the shared floor plan. Averaged over 12 random seeds on this 68 m route: with all layers on ≈ 1.03 m mean error achieved from a SINGLE entrance scan, versus ≈ 5.4 m mean drifting to ≈ 13 m and the wrong floor when dead reckoning runs alone. Note that "all layers on" and "no QR after the entrance" measure identically — the entrance scan is the starting gun, not a contributor. QR anchors earn their place on the recovery path, which is why re-scanning is a button rather than something that happens to you.`}
         />
 
         {/* ---- Layer toggles ---- */}
@@ -582,9 +703,9 @@ export default function FusionTab() {
             <Toggle
               checked={layers.qr}
               onChange={(v) => setLayers((l) => ({ ...l, qr: v }))}
-              label="1 · QR anchors — exact truth"
+              label="1 · QR anchors — exact truth, on demand"
               accent="warn"
-              hint={`Printed codes at ${QR_ANCHORS.length} points. Scanning one snaps the estimate onto it and resets drift to zero. Weakness: only works at the instant you pass one.`}
+              hint={`Printed codes at ${QR_ANCHORS.length} points. One scan at the entrance starts the session; after that use the Scan button only if the dot looks wrong. A scan places you at the code's own coordinates, so any residual error is simply how far you are standing from it — at most the ${QR_RADIUS_M} m scan range. Weakness: it needs the user to stop and aim a camera, so it can never be the everyday mechanism.`}
             />
             <Toggle
               checked={layers.dr}

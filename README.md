@@ -135,16 +135,41 @@ it live.
 
 **Tab 3 — fusion** (mean error over the 68 m route, averaged across 12 seeds)
 
-| Layers active | Mean error | Final error |
-| --- | --- | --- |
-| All four | **1.1 m** | 1.2 m |
-| Dead reckoning + Wi-Fi | 1.0 m | 1.4 m |
-| Dead reckoning + QR | 1.9 m | 1.3 m |
-| Dead reckoning only | 5.4 m | 13.1 m, on the wrong floor |
-| Wi-Fi + map matching | 5.6 m | 6.4 m (the dot lags the walker) |
+The user scans **one** QR code, at the entrance directory board, to start the
+session. Everything after that is the phone's own work — scanning is a deliberate
+act, not a beacon that fires as you walk past, so nothing auto-corrects.
 
-Two findings worth pointing at during a defence: dead reckoning alone ends up on
-the **wrong floor**, because a step counter cannot feel an escalator; and Wi-Fi
-alone is accurate but too slow to drive a smooth dot, so it visibly trails
-behind. Neither is fixable within a single method — which is the argument for the
-ladder.
+Error is reported as **horizontal** distance, with floor correctness as its own
+separate metric — the same convention as Tab 2. Folding them into one number
+would hide the failure that matters most: being sub-metre accurate on the wrong
+level is not sub-metre accuracy.
+
+| Layers active | Mean error | Final error | Floor correct | Scans |
+| --- | --- | --- | --- | --- |
+| All four | **1.03 m** | 1.1 m | 100% | 1 |
+| No Wi-Fi (DR + map matching) | 5.0 m | 13.8 m | 65% | 1 |
+| Dead reckoning alone | 5.4 m | 13.1 m | 65% | 1 |
+| Dead reckoning alone + 1 recovery scan | 2.2 m | 3.4 m | 67% | 2 |
+| Wi-Fi + map matching | 5.6 m | 6.4 m | 100% | 1 |
+
+The entrance scan is the starting gun, not a contributor — "all four layers" and
+"the same minus QR after the entrance" measure identically. QR anchors earn their
+place on the **recovery** path: one deliberate re-scan when the dot has visibly
+drifted cuts mean error from 5.4 m to 2.2 m.
+
+Four findings worth pointing at during a defence:
+
+- Dead reckoning alone spends **35% of the walk on the wrong floor**, because a
+  step counter cannot feel an escalator. Only Wi-Fi or a QR scan recovers it.
+- Wi-Fi alone is accurate but too slow to drive a smooth dot, so it visibly
+  trails the walker.
+- A QR scan does **not** reduce error to zero. The code encodes *its own*
+  coordinates, so scanning places you where the code is; the residual is however
+  far you are standing from it, bounded by the 1.8 m scan range. Snapping to the
+  true position would overstate what the method delivers.
+- Map matching barely helps here (5.4 m → 5.0 m). It corrects error *across* a
+  corridor but is blind to error *along* it, and unaided dead-reckoning drift is
+  mostly along-corridor.
+
+None of the first two is fixable within a single method — which is the argument
+for the ladder.
