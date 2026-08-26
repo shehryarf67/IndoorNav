@@ -256,6 +256,7 @@ export function initFusionState(plan, seed = 7, layers = { qr: true }, ctx = nul
       : initParticlesAt(truth, truth.level, rng);
 
   const summary = summariseParticles(particles);
+  const sensorHypotheses = summariseSensorHypotheses(particles);
 
   return {
     t: 0,
@@ -266,6 +267,8 @@ export function initFusionState(plan, seed = 7, layers = { qr: true }, ctx = nul
     spreadM: summary.spreadM,
     floorConfidence: summary.floorConfidence,
     modeShare: summary.modeShare,
+    learnedHeadingCorrectionRad: sensorHypotheses.headingCorrectionRad,
+    learnedStrideScale: sensorHypotheses.strideScale,
 
     /**
      * The true compass error — a property of the hardware, not of the estimate.
@@ -302,6 +305,7 @@ export function initFusionState(plan, seed = 7, layers = { qr: true }, ctx = nul
      * sub-metre accuracy, and one blended number would hide that.
      */
     currentError: 0,
+    confidenceTrail: [{ t: 0, spreadM: summary.spreadM, errorM: 0, floorCorrect: true }],
     wrongFloor: false,
     floorCorrectCount: 0,
     /**
@@ -455,6 +459,9 @@ export function stepFusion(state, dt, plan, layers, ctx, wifiIntervalS = DEFAULT
     s.spreadM = summary.spreadM;
     s.floorConfidence = summary.floorConfidence;
     s.modeShare = summary.modeShare;
+    const sensorHypotheses = summariseSensorHypotheses(particles);
+    s.learnedHeadingCorrectionRad = sensorHypotheses.headingCorrectionRad;
+    s.learnedStrideScale = sensorHypotheses.strideScale;
   }
 
   // ---- Bookkeeping --------------------------------------------------------
@@ -475,6 +482,16 @@ export function stepFusion(state, dt, plan, layers, ctx, wifiIntervalS = DEFAULT
   if (!isWalkable(s.est.level, s.est)) {
     s.wallViolationCount = (state.wallViolationCount ?? 0) + 1;
   }
+
+  s.confidenceTrail = [
+    ...(state.confidenceTrail ?? []),
+    {
+      t: s.t,
+      spreadM: s.spreadM,
+      errorM: s.currentError,
+      floorCorrect: !s.wrongFloor,
+    },
+  ].slice(-900);
 
   s.trueTrail = appendTrail(state.trueTrail, s.truth);
   s.estTrail = appendTrail(state.estTrail, s.est);
@@ -563,6 +580,15 @@ function appendTrail(trail, p) {
   const last = trail[trail.length - 1];
   if (last && last.level === p.level && dist(last, p) < 0.4) return trail;
   return [...trail, { x: p.x, y: p.y, level: p.level }];
+}
+
+/** Weighted sensor-error hypotheses carried by the particle cloud itself. */
+function summariseSensorHypotheses(particles) {
+  const totalW = particles.reduce((sum, p) => sum + p.w, 0) || 1;
+  return {
+    headingCorrectionRad: particles.reduce((sum, p) => sum + p.ho * p.w, 0) / totalW,
+    strideScale: particles.reduce((sum, p) => sum + p.ss * p.w, 0) / totalW,
+  };
 }
 
 /** Prepend an event to the activity log, keeping it short. */

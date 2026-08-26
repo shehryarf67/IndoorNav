@@ -49,6 +49,8 @@ export const MAP_MODEL = Object.freeze({
   floorLossDb: 15, // attenuation per floor slab crossed
   crowdOffsetDb: 0, // uniform extra absorption (bodies, stock, humidity)
   noiseSigmaDb: 3.5, // std. dev. of measurement noise
+  apOffsetScaleDb: 0, // per-AP hardware/antenna variation; reality-only stressor
+  fadingAmplitudeDb: 0, // spatially correlated multipath field; reality-only stressor
   floorDbm: -100, // receiver sensitivity floor — nothing is heard below this
 });
 
@@ -118,15 +120,42 @@ export function predictRssi(point, level, ap, wallsByLevel, model) {
   const d = Math.max(1, dist(point, ap));
   const walls = countWallsCrossed(point, ap, wallsByLevel.get(level) ?? []);
   const floors = Math.abs((ap.level ?? level) - level);
+  const apOffset = deterministicApOffset(ap.id) * (model.apOffsetScaleDb ?? 0);
+  const fading = correlatedFading(point, level, ap.id, model.fadingAmplitudeDb ?? 0);
 
   const rssi =
     model.p0 -
     10 * model.n * Math.log10(d) -
     walls * model.wallLossDb -
     floors * model.floorLossDb -
-    model.crowdOffsetDb;
+    model.crowdOffsetDb +
+    apOffset +
+    fading;
 
   return Math.max(model.floorDbm, rssi);
+}
+
+/** Stable value in [-1, 1] representing AP-specific transmit/antenna variation. */
+export function deterministicApOffset(apId) {
+  let hash = 2166136261;
+  for (const char of String(apId)) {
+    hash ^= char.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return ((hash >>> 0) / 4294967295) * 2 - 1;
+}
+
+/**
+ * A smooth, deterministic field that changes over space but not between runs.
+ * It approximates building-specific multipath that a distance/wall formula
+ * cannot express, without pretending to be a full electromagnetic simulator.
+ */
+export function correlatedFading(point, level, apId, amplitudeDb) {
+  if (!amplitudeDb) return 0;
+  const seed = deterministicApOffset(`${apId}:${level}`) * Math.PI;
+  const a = Math.sin(point.x / 7 + seed) * Math.cos(point.y / 6 - seed * 0.7);
+  const b = Math.sin((point.x + point.y) / 11 - seed * 1.3);
+  return amplitudeDb * (0.7 * a + 0.3 * b);
 }
 
 /**
@@ -417,7 +446,14 @@ export function trilaterate(obs, aps, model, bounds, useStrongest = 5) {
  *   may deliberately differ from the one the radio map was built with
  * @param {number} seed RNG seed, for reproducible results
  */
-export function evaluateBatch(radioMap, levels, trials, realityModel, seed = 2026) {
+export function evaluateBatch(
+  radioMap,
+  levels,
+  trials,
+  realityModel,
+  seed = 2026,
+  realityAps = radioMap.aps,
+) {
   const rng = makeRng(seed);
   const { aps, wallsByLevel } = radioMap;
   const bounds = buildingBounds(levels);
@@ -429,7 +465,7 @@ export function evaluateBatch(radioMap, levels, trials, realityModel, seed = 202
     const level = levels[Math.floor(rng() * levels.length)];
     const truth = randomWalkablePoint(level, rng);
 
-    const obs = observeVector(truth, level.level, aps, wallsByLevel, realityModel, rng);
+    const obs = observeVector(truth, level.level, realityAps, wallsByLevel, realityModel, rng);
 
     const fp = knnFingerprint(obs, radioMap);
     const tri = trilaterate(obs, aps, radioMap.model, bounds);

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { LEVELS, VERTICAL_LINKS, getLevel } from '../floorplan/floorplan.js';
+import { LEVELS, VERTICAL_LINKS } from '../floorplan/floorplan.js';
+import { ALTERNATE_LEVELS, ALTERNATE_VERTICAL_LINKS } from '../floorplan/alternateFloorplan.js';
 import {
   buildNavGraph,
   findRoute,
@@ -10,7 +11,7 @@ import {
 import { dist } from '../floorplan/geometry.js';
 import FloorPlanSvg from '../components/FloorPlanSvg.jsx';
 import ExplainerPanel from '../components/ExplainerPanel.jsx';
-import { Panel, Button, Toggle, Stat, Select, Badge } from '../components/ui.jsx';
+import { Panel, Button, Toggle, Stat, Select, Badge, EvidenceStrip } from '../components/ui.jsx';
 
 /**
  * TAB 1 — Auto Map Builder
@@ -31,7 +32,8 @@ const REVEAL_MS = 1400;
 /** Batch size used to measure per-run generation cost above timer resolution. */
 const GEN_SAMPLES = 200;
 
-export default function MapBuilderTab() {
+export default function MapBuilderTab({ presentationMode = false }) {
+  const [scenario, setScenario] = useState('mall');
   const [graph, setGraph] = useState(null);
   const [genMs, setGenMs] = useState(null);
   const [reveal, setReveal] = useState(0);
@@ -40,9 +42,13 @@ export default function MapBuilderTab() {
   const [destId, setDestId] = useState('');
   const [accessibleOnly, setAccessibleOnly] = useState(false);
   const [pickTarget, setPickTarget] = useState('start');
+  const [inspectStage, setInspectStage] = useState('input');
   const rafRef = useRef(null);
+  const stageTimersRef = useRef([]);
 
-  const level = getLevel(levelNo);
+  const currentLevels = scenario === 'mall' ? LEVELS : ALTERNATE_LEVELS;
+  const currentLinks = scenario === 'mall' ? VERTICAL_LINKS : ALTERNATE_VERTICAL_LINKS;
+  const level = currentLevels.find((l) => l.level === levelNo) ?? currentLevels[0];
 
   // ---- Graph generation ---------------------------------------------------
   /**
@@ -60,16 +66,17 @@ export default function MapBuilderTab() {
     // does: warm the JIT up, then time a batch and divide. The reported figure
     // is the per-run cost, measured over an interval long enough for the clock
     // to be meaningful.
-    let g = buildNavGraph(LEVELS, VERTICAL_LINKS); // warm-up, result discarded
+    let g = buildNavGraph(currentLevels, currentLinks); // warm-up, result discarded
     const t0 = performance.now();
     for (let i = 0; i < GEN_SAMPLES; i++) {
-      g = buildNavGraph(LEVELS, VERTICAL_LINKS);
+      g = buildNavGraph(currentLevels, currentLinks);
     }
     const elapsed = (performance.now() - t0) / GEN_SAMPLES;
 
     setGraph(g);
     setGenMs(elapsed);
     setReveal(0);
+    setInspectStage('centrelines');
 
     // Pick a cross-level default route so the first thing the viewer sees is
     // the most interesting capability.
@@ -78,6 +85,24 @@ export default function MapBuilderTab() {
     const defaultDest = doors.find((d) => d.label === 'Cinepax Cinema') ?? doors[doors.length - 1];
     setStartId(defaultStart.id);
     setDestId(defaultDest.id);
+    stageTimersRef.current.forEach(clearTimeout);
+    stageTimersRef.current = [
+      setTimeout(() => setInspectStage('graph'), 500),
+      setTimeout(() => setInspectStage('route'), 1200),
+    ];
+  }, [currentLevels, currentLinks]);
+
+  const chooseScenario = useCallback((next) => {
+    stageTimersRef.current.forEach(clearTimeout);
+    setScenario(next);
+    setGraph(null);
+    setGenMs(null);
+    setReveal(0);
+    setInspectStage('input');
+    setLevelNo(1);
+    setStartId('');
+    setDestId('');
+    setAccessibleOnly(false);
   }, []);
 
   // ---- Reveal animation ---------------------------------------------------
@@ -183,13 +208,35 @@ export default function MapBuilderTab() {
   const destNode = graph?.nodeById.get(destId);
 
   // Manual-tracing comparison for the headline metric.
-  const manualMinutes = MANUAL_MINUTES_PER_FLOOR * LEVELS.length;
-  const speedup = genMs ? (manualMinutes * 60_000) / genMs : 0;
+  const manualMinutes = MANUAL_MINUTES_PER_FLOOR * currentLevels.length;
+  const validation = useMemo(() => (graph ? validateGraph(graph) : null), [graph]);
 
   return (
     <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_360px]">
       {/* ================= MAP COLUMN ================= */}
       <div className="space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="inline-flex rounded-lg border border-line bg-surface p-0.5" aria-label="Floor-plan scenario">
+            {[
+              ['mall', 'Main mall · two levels'],
+              ['annex', 'Unseen annex · irregular'],
+            ].map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => chooseScenario(id)}
+                aria-pressed={scenario === id}
+                className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-brand ${
+                  scenario === id ? 'bg-brand text-white' : 'text-ink-soft hover:text-ink'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <Badge tone="warn">structured geometry input</Badge>
+        </div>
+
         {/* Headline metric — the single most important number in the project. */}
         <div className="rounded-xl border border-line bg-surface p-4">
           <div className="flex flex-wrap items-center justify-between gap-4">
@@ -207,34 +254,53 @@ export default function MapBuilderTab() {
                   Graph generated in {genMs.toFixed(2)} ms
                   <span className="ml-2 text-sm font-normal text-ink-soft">
                     (mean of {GEN_SAMPLES} runs) vs ~{manualMinutes} min of manual tracing (
-                    {MANUAL_MINUTES_PER_FLOOR} min × {LEVELS.length} floors)
+                    {MANUAL_MINUTES_PER_FLOOR} min × {currentLevels.length} floor{currentLevels.length === 1 ? '' : 's'})
                   </span>
                 </p>
               )}
             </div>
             <div className="flex items-center gap-3">
-              {genMs !== null && (
-                <div className="text-right">
-                  <div className="text-[10px] font-bold uppercase tracking-[0.08em] text-ink-faint">
-                    Speed-up
-                  </div>
-                  <div className="tnum text-2xl font-semibold text-good">
-                    {formatSpeedup(speedup)}
-                  </div>
-                  <div className="text-[10px] text-ink-faint">compute time vs human labour</div>
-                </div>
-              )}
+              {graph && <Badge tone="warn">SIMULATED PLAN</Badge>}
               <Button onClick={generate}>
-                {graph ? 'Regenerate graph' : 'Generate navigation graph'}
+                {graph ? 'Show derivation again' : 'Show the proof — generate graph'}
               </Button>
             </div>
           </div>
         </div>
 
+        <EvidenceStrip
+          proves="Corridor geometry becomes a connected, weighted navigation graph without hand-placing nodes."
+          value="The same graph supports routing, level changes, and accessibility rules immediately."
+          limitation="The demo starts from clean vector geometry; image segmentation is not implemented here."
+        />
+
+        {graph && (
+          <div className="grid grid-cols-4 overflow-hidden rounded-lg border border-line bg-surface" aria-label="Derivation stages">
+            {[
+              ['input', '1 · Input'],
+              ['centrelines', '2 · Centrelines'],
+              ['graph', '3 · Graph'],
+              ['route', '4 · Route'],
+            ].map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setInspectStage(id)}
+                aria-pressed={inspectStage === id}
+                className={`border-r border-line px-2 py-2 text-[11px] font-semibold last:border-r-0 ${
+                  inspectStage === id ? 'bg-blue-50 text-brand' : 'text-ink-soft hover:bg-canvas'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
+
         {/* Level switcher + pick-mode hint */}
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="inline-flex rounded-lg border border-line bg-surface p-0.5">
-            {LEVELS.map((l) => (
+            {currentLevels.map((l) => (
               <button
                 key={l.level}
                 type="button"
@@ -268,7 +334,25 @@ export default function MapBuilderTab() {
             cursor={graph ? 'crosshair' : 'default'}
             dimShops={!!graph}
           >
-            {graph && revealOrder && (
+            {graph && inspectStage !== 'input' && (
+              <g style={{ pointerEvents: 'none' }}>
+                {level.centrelines.map((c) => (
+                  <line
+                    key={c.id}
+                    x1={c.a.x}
+                    y1={c.a.y}
+                    x2={c.b.x}
+                    y2={c.b.y}
+                    stroke="#0ea5e9"
+                    strokeWidth={2.5}
+                    strokeDasharray="6 4"
+                    vectorEffect="non-scaling-stroke"
+                    opacity={inspectStage === 'centrelines' ? 1 : 0.32}
+                  />
+                ))}
+              </g>
+            )}
+            {graph && revealOrder && (inspectStage === 'graph' || inspectStage === 'route') && (
               <>
                 {/* --- Navigation graph edges --- */}
                 <g>
@@ -324,7 +408,23 @@ export default function MapBuilderTab() {
                 </g>
 
                 {/* --- Computed route --- */}
-                {routeRuns
+                {inspectStage === 'route' && accessibleOnly && defaultRoute &&
+                  splitRouteByLevel(graph, defaultRoute)
+                    .filter((run) => run.level === levelNo)
+                    .map((run, i) => (
+                      <polyline
+                        key={`fast-${i}`}
+                        points={run.points.map((p) => `${p.x},${p.y}`).join(' ')}
+                        fill="none"
+                        stroke="#94a3b8"
+                        strokeWidth={4}
+                        strokeDasharray="7 5"
+                        strokeLinejoin="round"
+                        strokeLinecap="round"
+                        vectorEffect="non-scaling-stroke"
+                      />
+                    ))}
+                {inspectStage === 'route' && routeRuns
                   .filter((run) => run.level === levelNo)
                   .map((run, i) => (
                     <g key={i}>
@@ -353,13 +453,13 @@ export default function MapBuilderTab() {
                   ))}
 
                 {/* --- Start / destination markers --- */}
-                {startNode?.level === levelNo && (
+                {inspectStage === 'route' && startNode?.level === levelNo && (
                   <EndpointMarker node={startNode} kind="start" />
                 )}
-                {destNode?.level === levelNo && <EndpointMarker node={destNode} kind="dest" />}
+                {inspectStage === 'route' && destNode?.level === levelNo && <EndpointMarker node={destNode} kind="dest" />}
 
                 {/* --- Cross-level hand-off marker --- */}
-                {route?.transports.map((t) => {
+                {inspectStage === 'route' && route?.transports.map((t) => {
                   const linkNode = graph.nodes.find(
                     (n) => n.kind === 'link' && n.label === t.label && n.level === levelNo,
                   );
@@ -414,7 +514,14 @@ export default function MapBuilderTab() {
             'Today that graph is traced by hand — someone opens the architect’s drawing and clicks out every corridor and doorway, roughly 30–40 minutes per floor, redone whenever a tenant moves. This tab derives the same graph from the floor plan’s geometry in a few milliseconds.',
             'Once the graph exists, finding a route is a solved problem: A* explores the graph outward from your start, always expanding the option with the lowest (distance walked + straight-line distance still to go), which guarantees the shortest path.',
           ]}
+          defaultOpen={!presentationMode}
           legend={[
+            {
+              kind: 'dashed',
+              color: '#0ea5e9',
+              label: 'Recovered centreline',
+              desc: 'the corridor skeleton from which junctions and weighted edges are derived',
+            },
             {
               kind: 'square',
               color: '#f1f5f9',
@@ -485,8 +592,8 @@ export default function MapBuilderTab() {
               desc: 'blue outline = step-free. The escalator and stairs are grey because they are not',
             },
           ]}
-          whyItMatters="If digitizing a mall costs minutes of compute instead of hours of human labour, MallNav can onboard a new mall the day it signs — which is what makes the product scalable rather than a one-off installation."
-          footnote="How this scales to real plans: production MallNav runs this same pipeline on a floor plan image — semantic segmentation to separate walls from walkable floor, then morphological skeletonisation of the walkable mask to recover corridor centrelines. Every step after that (junction detection, door projection, edge weighting, A*) is identical to what is running here. This demo starts from clean vector geometry so the graph derivation itself is visible rather than buried behind image processing."
+          whyItMatters="Once a venue has structured geometry, MallNav can derive routing data consistently instead of hand-placing every junction, doorway, and edge for every floor."
+          footnote="Scope boundary: this demo begins with clean vector geometry and proves the geometry-to-graph stage. A production image pipeline would first segment walkable space and recover centrelines; that image-processing stage is future work, not something this screen claims to have implemented."
         />
 
         {/* ---- Routing controls ---- */}
@@ -502,10 +609,10 @@ export default function MapBuilderTab() {
           ) : (
             <div className="space-y-3">
               <Select label="Start" value={startId} onChange={setStartId}>
-                {renderDoorOptions(graph)}
+                {renderDoorOptions(graph, currentLevels)}
               </Select>
               <Select label="Destination" value={destId} onChange={setDestId}>
-                {renderDoorOptions(graph)}
+                {renderDoorOptions(graph, currentLevels)}
               </Select>
 
               <div className="border-t border-line pt-3">
@@ -513,7 +620,12 @@ export default function MapBuilderTab() {
                   checked={accessibleOnly}
                   onChange={setAccessibleOnly}
                   label="Step-free route only"
-                  hint="Removes stairs and escalator edges from the graph, forcing the lift. For wheelchairs, prams and luggage."
+                  disabled={currentLinks.length === 0}
+                  hint={
+                    currentLinks.length
+                      ? 'Removes stairs and escalator edges from the graph, forcing the lift. For wheelchairs, prams and luggage.'
+                      : 'This one-level annex has no vertical transport to filter.'
+                  }
                 />
               </div>
 
@@ -614,7 +726,7 @@ export default function MapBuilderTab() {
               <Stat
                 label="Levels linked"
                 value={graph.stats.levelCount}
-                hint={`${VERTICAL_LINKS.length} vertical links`}
+                hint={`${currentLinks.length} vertical links`}
               />
             </div>
             {route && (
@@ -624,8 +736,15 @@ export default function MapBuilderTab() {
                 lets it ignore the rest.
               </p>
             )}
+            {validation && (
+              <div className="mt-3 grid gap-1.5 rounded-lg border border-line bg-canvas px-3 py-2 text-[11px]">
+                <ValidationRow ok={validation.connected} label="One connected graph" />
+                <ValidationRow ok={validation.noOrphans} label="No orphan nodes" />
+                <ValidationRow ok={validation.allDoorsReachable} label="Every shop door reachable" />
+              </div>
+            )}
             <div className="mt-3 flex flex-wrap gap-1.5">
-              {VERTICAL_LINKS.map((v) => (
+              {currentLinks.map((v) => (
                 <Badge key={v.id} tone={v.accessible ? 'brand' : 'neutral'}>
                   {v.label} · {v.accessible ? 'step-free' : 'steps'}
                 </Badge>
@@ -639,8 +758,8 @@ export default function MapBuilderTab() {
 }
 
 /** Grouped <option> list of every shop door, by level. */
-function renderDoorOptions(graph) {
-  return LEVELS.map((l) => (
+function renderDoorOptions(graph, levels) {
+  return levels.map((l) => (
     <optgroup key={l.level} label={l.name}>
       {graph.nodes
         .filter((n) => n.kind === 'door' && n.level === l.level)
@@ -697,9 +816,34 @@ function formatDuration(seconds) {
   return `${Math.floor(s / 60)} min ${s % 60} s`;
 }
 
-/** Compact speed-up factor: 2100000 -> "2.1M×". */
-function formatSpeedup(x) {
-  if (x >= 1e6) return `${(x / 1e6).toFixed(1)}M×`;
-  if (x >= 1e3) return `${(x / 1e3).toFixed(0)}k×`;
-  return `${Math.round(x)}×`;
+function validateGraph(graph) {
+  if (!graph.nodes.length) return { connected: false, noOrphans: false, allDoorsReachable: false };
+  const neighbours = new Map(graph.nodes.map((node) => [node.id, []]));
+  for (const edge of graph.edges) {
+    neighbours.get(edge.from)?.push(edge.to);
+    neighbours.get(edge.to)?.push(edge.from);
+  }
+  const visited = new Set();
+  const queue = [graph.nodes[0].id];
+  while (queue.length) {
+    const id = queue.shift();
+    if (visited.has(id)) continue;
+    visited.add(id);
+    for (const next of neighbours.get(id) ?? []) if (!visited.has(next)) queue.push(next);
+  }
+  const doors = graph.nodes.filter((node) => node.kind === 'door');
+  return {
+    connected: visited.size === graph.nodes.length,
+    noOrphans: [...neighbours.values()].every((list) => list.length > 0),
+    allDoorsReachable: doors.every((door) => visited.has(door.id)),
+  };
+}
+
+function ValidationRow({ ok, label }) {
+  return (
+    <div className="flex items-center justify-between gap-2">
+      <span className="text-ink-soft">{label}</span>
+      <Badge tone={ok ? 'good' : 'bad'}>{ok ? 'pass' : 'fail'}</Badge>
+    </div>
+  );
 }

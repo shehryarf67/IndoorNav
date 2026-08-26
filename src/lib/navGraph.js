@@ -71,7 +71,9 @@ export function buildNavGraph(levels, verticalLinks) {
 
     for (const shop of level.shops) {
       const axis = Math.abs(shop.outward.y) > 0 ? 'h' : 'v';
-      const cl = level.centrelines.find((c) => c.axis === axis);
+      const candidates = level.centrelines.filter((c) => c.axis === axis);
+      const cl = nearestCentreline(candidates, shop.doorNode);
+      if (!cl) continue;
       perCentreline.get(cl.id).push({
         kind: 'access',
         point: shop.doorNode,

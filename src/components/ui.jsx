@@ -50,7 +50,7 @@ export function Button({
       onClick={onClick}
       disabled={disabled}
       title={title}
-      className={`inline-flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed ${styles} ${className}`}
+      className={`inline-flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand disabled:cursor-not-allowed ${styles} ${className}`}
     >
       {children}
     </button>
@@ -163,5 +163,24 @@ export function Badge({ children, tone = 'neutral' }) {
     >
       {children}
     </span>
+  );
+}
+
+/** Three short statements that keep each prototype's defence story visible. */
+export function EvidenceStrip({ proves, value, limitation }) {
+  const items = [
+    ['What this proves', proves, 'text-brand'],
+    ['Why it matters', value, 'text-good'],
+    ['Honest limitation', limitation, 'text-warn'],
+  ];
+  return (
+    <section className="grid overflow-hidden rounded-xl border border-line bg-surface md:grid-cols-3">
+      {items.map(([label, text, tone], index) => (
+        <div key={label} className={`px-4 py-3 ${index ? 'border-t border-line md:border-l md:border-t-0' : ''}`}>
+          <div className={`text-[10px] font-bold uppercase tracking-[0.08em] ${tone}`}>{label}</div>
+          <p className="mt-1 text-xs font-medium leading-relaxed text-ink">{text}</p>
+        </div>
+      ))}
+    </section>
   );
 }

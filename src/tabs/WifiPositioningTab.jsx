@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useState } from 'react';
 import { LEVELS, ALL_APS, getLevel, isWalkable, BUILDING } from '../floorplan/floorplan.js';
-import { dist } from '../floorplan/geometry.js';
+import { countWallsCrossed, dist } from '../floorplan/geometry.js';
 import {
   MAP_MODEL,
   KNN_K,
@@ -14,11 +14,13 @@ import {
   evaluateBatch,
   buildingBounds,
   makeRng,
+  rssiToDistance,
 } from '../lib/wifi.js';
+import { runApCalibration } from '../lib/apCalibration.js';
 import { RSSI_BANDS, ERROR_BANDS, rssiColor, errorColor } from '../lib/signalColor.js';
 import FloorPlanSvg from '../components/FloorPlanSvg.jsx';
 import ExplainerPanel from '../components/ExplainerPanel.jsx';
-import { Panel, Button, Stat, Select, Slider, Badge } from '../components/ui.jsx';
+import { Panel, Button, Stat, Select, Slider, Badge, EvidenceStrip } from '../components/ui.jsx';
 
 /**
  * TAB 2 — Wi-Fi Positioning
@@ -39,14 +41,42 @@ const HEATMAP_CELL_M = 0.8;
 /** Number of random positions the batch comparison evaluates. */
 const BATCH_TRIALS = 400;
 
-/** The three things the map can show. Only one at a time, so it stays readable. */
+/** The four experiments form one guided argument, while keeping the map readable. */
 const VIEWS = [
   { id: 'coverage', label: 'Coverage heatmap', hint: 'why trilateration fails' },
   { id: 'live', label: 'Live positioning', hint: 'click to place yourself' },
   { id: 'errors', label: 'Error map', hint: 'where accuracy is weak' },
+  { id: 'calibration', label: 'AP calibration', hint: 'locate unknown routers from 20 stops' },
 ];
 
-export default function WifiPositioningTab() {
+const REALITY_PRESETS = [
+  { id: 'ideal', label: 'Empty mall', values: { ...MAP_MODEL } },
+  {
+    id: 'busy',
+    label: 'Busy Saturday',
+    values: { ...MAP_MODEL, crowdOffsetDb: 5, noiseSigmaDb: 5 },
+  },
+  {
+    id: 'phone',
+    label: 'Different phone',
+    values: { ...MAP_MODEL, apOffsetScaleDb: 3, noiseSigmaDb: 6 },
+  },
+  {
+    id: 'breakdown',
+    label: 'Model breakdown',
+    values: {
+      ...MAP_MODEL,
+      n: 3.3,
+      wallLossDb: 9,
+      apOffsetScaleDb: 3,
+      fadingAmplitudeDb: 5,
+      crowdOffsetDb: 4,
+      noiseSigmaDb: 5,
+    },
+  },
+];
+
+export default function WifiPositioningTab({ presentationMode = false }) {
   const [radioMap, setRadioMap] = useState(null);
   const [levelNo, setLevelNo] = useState(1);
   const [view, setView] = useState('coverage');
@@ -54,6 +84,8 @@ export default function WifiPositioningTab() {
   const [truePoint, setTruePoint] = useState(null);
   const [batch, setBatch] = useState(null);
   const [batchMs, setBatchMs] = useState(null);
+  const [calibration, setCalibration] = useState(null);
+  const [calibrating, setCalibrating] = useState(false);
 
   /**
    * The "real world" propagation parameters. The radio map is always built with
@@ -69,7 +101,9 @@ export default function WifiPositioningTab() {
       reality.n !== MAP_MODEL.n ||
       reality.wallLossDb !== MAP_MODEL.wallLossDb ||
       reality.crowdOffsetDb !== MAP_MODEL.crowdOffsetDb ||
-      reality.noiseSigmaDb !== MAP_MODEL.noiseSigmaDb,
+      reality.noiseSigmaDb !== MAP_MODEL.noiseSigmaDb ||
+      reality.apOffsetScaleDb !== MAP_MODEL.apOffsetScaleDb ||
+      reality.fadingAmplitudeDb !== MAP_MODEL.fadingAmplitudeDb,
     [reality],
   );
 
@@ -79,6 +113,7 @@ export default function WifiPositioningTab() {
     setRadioMap(rm);
     setBatch(null);
     setTruePoint(null);
+    setCalibration(null);
   }, []);
 
   // ---- 2. Coverage heatmap ------------------------------------------------
@@ -156,7 +191,36 @@ export default function WifiPositioningTab() {
     setView('errors');
   }, [radioMap, reality]);
 
+  const runCalibration = useCallback(() => {
+    setCalibrating(true);
+    setTimeout(() => {
+      const result = runApCalibration(LEVELS, ALL_APS, MAP_MODEL);
+      const estimatedMap = buildRadioMap(
+        LEVELS,
+        result.estimatedAps,
+        DEFAULT_SPACING_M,
+        result.fittedModel,
+      );
+      const idealBatch = evaluateBatch(radioMap, LEVELS, BATCH_TRIALS, MAP_MODEL, 2026, ALL_APS);
+      const estimatedBatch = evaluateBatch(
+        estimatedMap,
+        LEVELS,
+        BATCH_TRIALS,
+        MAP_MODEL,
+        2026,
+        ALL_APS,
+      );
+      setCalibration({ ...result, estimatedMap, idealBatch, estimatedBatch });
+      setCalibrating(false);
+      setView('calibration');
+    }, 30);
+  }, [radioMap]);
+
   const selectedAp = ALL_APS.find((a) => a.id === selectedApId);
+  const wallExample = useMemo(
+    () => findWallFailureExample(level, selectedAp ?? ALL_APS[0], radioMap?.wallsByLevel),
+    [level, selectedAp, radioMap],
+  );
 
   return (
     <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_380px]">
@@ -178,7 +242,7 @@ export default function WifiPositioningTab() {
                 <p className="tnum mt-1 text-2xl font-semibold leading-tight text-ink">
                   {radioMap.points.length} reference points in {radioMap.buildMs.toFixed(0)} ms
                   <span className="ml-2 block text-sm font-normal text-ink-soft sm:inline">
-                    vs ~{(radioMap.surveyMinutes / 60).toFixed(1)} h of manual site survey (
+                    vs an estimated ~{(radioMap.surveyMinutes / 60).toFixed(1)} h manual site survey (
                     {SURVEY_MINUTES_PER_POINT} min per point, walked)
                   </span>
                 </p>
@@ -188,26 +252,32 @@ export default function WifiPositioningTab() {
               {radioMap && (
                 <div className="text-right">
                   <div className="text-[10px] font-bold uppercase tracking-[0.08em] text-ink-faint">
-                    Survey avoided
+                    Estimated survey effort
                   </div>
                   <div className="tnum text-2xl font-semibold text-good">
                     {(radioMap.surveyMinutes / 60).toFixed(1)} h
                   </div>
                   <div className="text-[10px] text-ink-faint">
-                    {radioMap.points.length} × {SURVEY_MINUTES_PER_POINT} min of walking
+                    assumption: {SURVEY_MINUTES_PER_POINT} min per point
                   </div>
                 </div>
               )}
               <Button onClick={generateRadioMap}>
-                {radioMap ? 'Rebuild radio map' : 'Generate radio map'}
+                {radioMap ? 'Rebuild radio map' : 'Show the proof — generate radio map'}
               </Button>
             </div>
           </div>
         </div>
 
+        <EvidenceStrip
+          proves="Walls make RSSI-to-distance geometry fail; fingerprint pattern matching remains useful."
+          value="A short calibration walk can estimate the radio model instead of measuring thousands of fingerprints."
+          limitation="All readings are simulated; structural mismatch shows why the headline accuracy is an optimistic floor."
+        />
+
         {/* ---- View switcher + level switcher ---- */}
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="inline-flex rounded-lg border border-line bg-surface p-0.5">
+          <div className="flex flex-wrap rounded-lg border border-line bg-surface p-0.5">
             {VIEWS.map((v) => (
               <button
                 key={v.id}
@@ -270,6 +340,12 @@ export default function WifiPositioningTab() {
                   : 'Run the batch comparison to populate this map.'}
               </>
             )}
+            {view === 'calibration' && (
+              <>
+                Twenty known stops replace a full fingerprint survey. Black rings are the real APs
+                (shown only for grading); blue markers are recovered positions. Lines are estimation error.
+              </>
+            )}
           </div>
         )}
 
@@ -277,7 +353,7 @@ export default function WifiPositioningTab() {
         <div className="rounded-xl border border-line bg-surface p-3">
           <FloorPlanSvg
             level={level}
-            showAps
+            showAps={view !== 'calibration'}
             showShopLabels={view !== 'coverage'}
             showVerticalLinks={view !== 'coverage'}
             onPointClick={handleMapClick}
@@ -303,10 +379,59 @@ export default function WifiPositioningTab() {
             {/* --- Radio map reference points --- */}
             {radioMap && view !== 'coverage' && (
               <g style={{ pointerEvents: 'none' }}>
-                {radioMap.points
+                {view !== 'calibration' && radioMap.points
                   .filter((p) => p.level === levelNo)
                   .map((p, i) => (
                     <circle key={i} cx={p.x} cy={p.y} r={0.22} fill="#94a3b8" opacity={0.75} />
+                  ))}
+              </g>
+            )}
+
+            {view === 'calibration' && calibration && (
+              <g style={{ pointerEvents: 'none' }}>
+                {calibration.stops
+                  .filter((stop) => stop.level === levelNo)
+                  .map((stop, index) => (
+                    <g key={stop.id}>
+                      <circle cx={stop.x} cy={stop.y} r={0.65} fill="#f59e0b" stroke="#ffffff" strokeWidth={1.2} vectorEffect="non-scaling-stroke" />
+                      <text x={stop.x} y={stop.y - 1.2} textAnchor="middle" fontSize={0.8} fill="#92400e" fontWeight={700}>
+                        {index + 1}
+                      </text>
+                    </g>
+                  ))}
+                {calibration.estimates
+                  .filter((item) => item.truth.level === levelNo || item.estimated.level === levelNo)
+                  .map((item) => (
+                    <g key={item.id}>
+                      {item.truth.level === levelNo && item.estimated.level === levelNo && (
+                        <line
+                          x1={item.truth.x}
+                          y1={item.truth.y}
+                          x2={item.estimated.x}
+                          y2={item.estimated.y}
+                          stroke="#2563eb"
+                          strokeWidth={1.5}
+                          vectorEffect="non-scaling-stroke"
+                        />
+                      )}
+                      {item.truth.level === levelNo && (
+                        <circle cx={item.truth.x} cy={item.truth.y} r={1.15} fill="none" stroke="#0f172a" strokeWidth={2} vectorEffect="non-scaling-stroke" />
+                      )}
+                      {item.estimated.level === levelNo && (
+                        <g>
+                          <path
+                            d={`M ${item.estimated.x} ${item.estimated.y - 1.2} L ${item.estimated.x + 1.2} ${item.estimated.y} L ${item.estimated.x} ${item.estimated.y + 1.2} L ${item.estimated.x - 1.2} ${item.estimated.y} Z`}
+                            fill="#2563eb"
+                            stroke="#ffffff"
+                            strokeWidth={1.2}
+                            vectorEffect="non-scaling-stroke"
+                          />
+                          <text x={item.estimated.x} y={item.estimated.y - 1.7} textAnchor="middle" fontSize={0.85} fill="#1e3a8a" fontWeight={700}>
+                            {item.id}
+                          </text>
+                        </g>
+                      )}
+                    </g>
                   ))}
               </g>
             )}
@@ -428,6 +553,7 @@ export default function WifiPositioningTab() {
           {/* ---- Map legend strip, specific to the active view ---- */}
           {radioMap && view === 'coverage' && <RssiLegend />}
           {radioMap && view === 'errors' && batch && <ErrorLegend />}
+          {radioMap && view === 'calibration' && calibration && <CalibrationLegend />}
         </div>
 
         {/* ---- Batch results ---- */}
@@ -465,6 +591,7 @@ export default function WifiPositioningTab() {
             'Fingerprinting sidesteps that entirely. It never converts signal to distance. It just asks: which stored fingerprint looks most like what I am hearing right now? The walls are already baked into both the stored patterns and the live reading, so there is no physics assumption left to get wrong.',
             'The second idea here is that the radio map does not have to be surveyed on foot. Because we know where the walls are, we can PREDICT what the Wi-Fi should look like everywhere — turning days of walking into milliseconds of compute.',
           ]}
+          defaultOpen={!presentationMode}
           legend={[
             {
               kind: 'dot',
@@ -522,8 +649,26 @@ export default function WifiPositioningTab() {
               label: 'Error map dots',
               desc: 'test positions coloured by fingerprinting error — green accurate, red poor',
             },
+            {
+              kind: 'ring',
+              color: '#0f172a',
+              label: 'True AP (simulation grading only)',
+              desc: 'black ring in calibration view — hidden from the estimator and shown only so the recovered AP can be graded',
+            },
+            {
+              kind: 'square',
+              color: '#2563eb',
+              label: 'Estimated AP',
+              desc: 'blue diamond inferred from the short calibration walk; its line to the black ring is localisation error',
+            },
+            {
+              kind: 'dot',
+              color: '#f59e0b',
+              label: 'Calibration stop',
+              desc: 'numbered measured positions selected across both floors; several RSSI scans are averaged at each stop',
+            },
           ]}
-          whyItMatters="Positioning is the product: without a reliable dot on the map there is no navigation — and predicting the radio map from the floor plan is what makes deploying it in a new mall a compute job rather than a week of someone walking the building with a laptop."
+          whyItMatters="Positioning is the product: the experiment tests whether modelling a small set of venue parameters can reduce—not magically eliminate—the site calibration needed for a usable blue dot."
           footnote={`Propagation model: RSSI = P0 − 10·n·log₁₀(d) − walls×wall_loss − floors×floor_loss + noise, with P0 = ${MAP_MODEL.p0} dBm, n = ${MAP_MODEL.n}, wall_loss = ${MAP_MODEL.wallLossDb} dB, floor_loss = ${MAP_MODEL.floorLossDb} dB, noise σ = ${MAP_MODEL.noiseSigmaDb} dB, signal floor ${MAP_MODEL.floorDbm} dBm. "walls" is the number of wall segments the straight line from the point to the AP intersects. Ported from the tested Python simulation.`}
         />
 
@@ -591,6 +736,14 @@ export default function WifiPositioningTab() {
                   </p>
                 )}
 
+                {wallExample && (
+                  <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[11px] leading-relaxed text-red-950">
+                    <strong>Why the circles lie:</strong> this worked example is {wallExample.realDistanceM.toFixed(1)} m from{' '}
+                    {wallExample.ap.id} through {wallExample.walls} walls. Its predicted {wallExample.rssiDbm.toFixed(1)} dBm signal is
+                    inverted as {wallExample.inferredDistanceM.toFixed(0)} m — the wall loss is mistaken for distance.
+                  </div>
+                )}
+
                 <div className="rounded-lg border border-line bg-canvas px-3 py-2">
                   <div className="text-[10px] font-bold uppercase tracking-[0.08em] text-ink-faint">
                     Floor detection
@@ -637,6 +790,71 @@ export default function WifiPositioningTab() {
           </Panel>
         )}
 
+        {radioMap && view === 'calibration' && (
+          <Panel
+            title="Short calibration walk"
+            subtitle="Measure the model, not the whole map"
+            actions={
+              <Button onClick={runCalibration} disabled={calibrating}>
+                {calibrating ? 'Estimating APs…' : calibration ? 'Run again' : 'Run 20-stop calibration'}
+              </Button>
+            }
+          >
+            {!calibration ? (
+              <div className="space-y-3 text-xs leading-relaxed text-ink-soft">
+                <p>
+                  The simulated technician stops at ten known points per floor and hears every AP.
+                  A coarse-to-fine nonlinear search estimates each AP, then least squares fits
+                  <strong className="text-ink"> n</strong> and <strong className="text-ink">wall loss</strong>.
+                </p>
+                <p className="rounded-lg bg-amber-50 px-3 py-2 text-amber-950">
+                  Best-case feasibility test: the same propagation model generates and fits the data.
+                  Real multipath and hardware variation are tested separately below.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                <div className="grid grid-cols-2 gap-2">
+                  <Stat label="Mean AP error" value={calibration.meanErrorM.toFixed(2)} unit="m" tone="good" />
+                  <Stat label="Correct AP floor" value={(calibration.floorAccuracy * 100).toFixed(0)} unit="%" tone="good" />
+                  <Stat label="Fitted n" value={calibration.fittedModel.n.toFixed(2)} hint={`truth ${MAP_MODEL.n}`} />
+                  <Stat label="Fitted wall loss" value={calibration.fittedModel.wallLossDb.toFixed(2)} unit="dB" hint={`truth ${MAP_MODEL.wallLossDb} dB`} />
+                </div>
+                <div className="rounded-lg border border-line bg-canvas px-3 py-2 text-xs leading-relaxed text-ink-soft">
+                  <strong className="text-ink">{calibration.measurementCount} measurements</strong> ({calibration.stops.length} stops × {ALL_APS.length} APs),
+                  about {calibration.estimatedWalkMinutes.toFixed(0)} minutes of walking, replace roughly {radioMap.points.length * ALL_APS.length} individually surveyed signal values.
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <Stat
+                    label="Ideal AP map"
+                    value={calibration.idealBatch.fingerprint.mean.toFixed(2)}
+                    unit="m"
+                    hint="true AP positions"
+                  />
+                  <Stat
+                    label="Estimated AP map"
+                    value={calibration.estimatedBatch.fingerprint.mean.toFixed(2)}
+                    unit="m"
+                    tone="brand"
+                    hint="same 400 test points"
+                  />
+                </div>
+                <details className="text-xs">
+                  <summary className="cursor-pointer font-semibold text-ink-soft">Per-AP errors</summary>
+                  <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1">
+                    {calibration.estimates.map((item) => (
+                      <div key={item.id} className="flex justify-between gap-2">
+                        <span>{item.id} · L{item.estimated.level}</span>
+                        <span className="tnum font-semibold text-ink">{item.errorM.toFixed(2)} m</span>
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              </div>
+            )}
+          </Panel>
+        )}
+
         {/* ---- Model mismatch experiment ---- */}
         {radioMap && (
           <Panel
@@ -658,6 +876,23 @@ export default function WifiPositioningTab() {
               rebuilt, so you are watching a predicted map cope with a building that does not match
               its assumptions.
             </p>
+            <div className="mb-4">
+              <div className="mb-1.5 text-[10px] font-bold uppercase tracking-[0.08em] text-ink-faint">
+                Defence challenge presets
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {REALITY_PRESETS.map((preset) => (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    onClick={() => setReality({ ...preset.values })}
+                    className="rounded-full border border-line bg-white px-2.5 py-1 text-[11px] font-semibold text-ink-soft hover:border-brand hover:text-brand focus-visible:outline-2 focus-visible:outline-brand"
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+            </div>
             <div className="space-y-3">
               <Slider
                 label="Real path-loss exponent (n)"
@@ -698,6 +933,33 @@ export default function WifiPositioningTab() {
                 onChange={(noiseSigmaDb) => setReality((r) => ({ ...r, noiseSigmaDb }))}
                 hint={`Map assumes ${MAP_MODEL.noiseSigmaDb} dB. Cheaper phone radios are noisier.`}
               />
+              <div className="rounded-lg border border-amber-200 bg-amber-50/60 px-3 py-2">
+                <div className="text-[10px] font-bold uppercase tracking-[0.08em] text-amber-800">
+                  Model-class mismatch · effects the formula cannot fit
+                </div>
+                <div className="mt-2 space-y-3">
+                  <Slider
+                    label="Per-AP hardware offset"
+                    value={reality.apOffsetScaleDb}
+                    min={0}
+                    max={5}
+                    step={0.5}
+                    unit=" dB"
+                    onChange={(apOffsetScaleDb) => setReality((r) => ({ ...r, apOffsetScaleDb }))}
+                    hint="Each router has a stable transmit-power/antenna bias that the shared model does not know."
+                  />
+                  <Slider
+                    label="Spatially correlated fading"
+                    value={reality.fadingAmplitudeDb}
+                    min={0}
+                    max={8}
+                    step={0.5}
+                    unit=" dB"
+                    onChange={(fadingAmplitudeDb) => setReality((r) => ({ ...r, fadingAmplitudeDb }))}
+                    hint="A smooth, repeatable multipath field varies by location and cannot be represented by distance plus wall count."
+                  />
+                </div>
+              </div>
             </div>
             {mismatched && (
               <p className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-[11px] leading-relaxed text-amber-900">
@@ -919,4 +1181,45 @@ function ErrorLegend() {
       </p>
     </div>
   );
+}
+
+function CalibrationLegend() {
+  return (
+    <div className="mt-3 flex flex-wrap gap-x-4 gap-y-2 border-t border-line pt-3 text-[11px] text-ink-soft">
+      <span className="flex items-center gap-1.5">
+        <span className="inline-block h-3 w-3 rounded-full border-2 border-ink" /> True AP (grading only)
+      </span>
+      <span className="flex items-center gap-1.5">
+        <span className="inline-block h-3 w-3 rotate-45 bg-brand" /> Estimated AP
+      </span>
+      <span className="flex items-center gap-1.5">
+        <span className="inline-block h-3 w-3 rounded-full bg-warn" /> Known calibration stop
+      </span>
+      <span className="flex items-center gap-1.5">
+        <span className="inline-block h-0.5 w-4 bg-brand" /> Position error
+      </span>
+    </div>
+  );
+}
+
+function findWallFailureExample(level, ap, wallsByLevel) {
+  if (!level || !ap || !wallsByLevel) return null;
+  let best = null;
+  for (const rect of level.corridors) {
+    for (let x = rect.x + 0.5; x < rect.x + rect.w; x += 1) {
+      for (let y = rect.y + 0.5; y < rect.y + rect.h; y += 1) {
+        const point = { x, y };
+        const walls = countWallsCrossed(point, ap, level.walls);
+        if (walls < 2) continue;
+        const realDistanceM = dist(point, ap);
+        const rssiDbm = predictRssi(point, level.level, ap, wallsByLevel, MAP_MODEL);
+        const inferredDistanceM = rssiToDistance(rssiDbm, MAP_MODEL);
+        const ratio = inferredDistanceM / Math.max(realDistanceM, 1);
+        if (!best || ratio > best.ratio) {
+          best = { point, ap, walls, realDistanceM, rssiDbm, inferredDistanceM, ratio };
+        }
+      }
+    }
+  }
+  return best;
 }

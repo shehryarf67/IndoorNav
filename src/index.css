@@ -11,7 +11,7 @@
 @theme {
   --color-ink: #0f172a;
   --color-ink-soft: #475569;
-  --color-ink-faint: #94a3b8;
+  --color-ink-faint: #64748b;
   --color-line: #e2e8f0;
   --color-surface: #ffffff;
   --color-canvas: #f8fafc;
@@ -43,6 +43,24 @@ body {
   font-family: var(--font-sans);
   font-feature-settings: 'cv05', 'ss01';
   -webkit-font-smoothing: antialiased;
+}
+
+button,
+input,
+select,
+summary {
+  accent-color: var(--color-brand);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 
 /* Tabular figures everywhere we show a measurement, so numbers don't jitter

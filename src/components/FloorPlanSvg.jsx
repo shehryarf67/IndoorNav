@@ -233,7 +233,11 @@ function ApMarker({ ap, highlighted = false }) {
         textAnchor="middle"
         fontSize={1}
         fontWeight={600}
-        fill="#5b21b6"
+        fill="#ffffff"
+        stroke="#4c1d95"
+        strokeWidth={2.8}
+        paintOrder="stroke"
+        vectorEffect="non-scaling-stroke"
       >
         {ap.id}
       </text>

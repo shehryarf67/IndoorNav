@@ -21,7 +21,7 @@ import {
 import { PF_CONFIG } from '../lib/particleFilter.js';
 import FloorPlanSvg from '../components/FloorPlanSvg.jsx';
 import ExplainerPanel from '../components/ExplainerPanel.jsx';
-import { Panel, Button, Toggle, Stat, Badge } from '../components/ui.jsx';
+import { Panel, Button, Toggle, Stat, Badge, EvidenceStrip } from '../components/ui.jsx';
 
 /**
  * TAB 3 — Positioning Fusion
@@ -44,6 +44,7 @@ const SPEEDS = [1, 2, 4];
 
 /** Draw at most this many particles, for render cost. */
 const MAX_DRAWN_PARTICLES = 220;
+const BASELINE_LAYERS = { dr: true, qr: true, wifi: false, mapMatch: false };
 
 /**
  * Preset layer combinations, for a fast A/B during a live demo.
@@ -80,7 +81,7 @@ const PRESETS = [
   },
 ];
 
-export default function FusionTab() {
+export default function FusionTab({ presentationMode = false }) {
   const [layers, setLayers] = useState({ dr: true, qr: true, wifi: true, mapMatch: true });
   const [running, setRunning] = useState(false);
   const [speed, setSpeed] = useState(1);
@@ -89,6 +90,7 @@ export default function FusionTab() {
   const [manualMode, setManualMode] = useState(false);
   const [showParticles, setShowParticles] = useState(true);
   const [wifiIntervalS, setWifiIntervalS] = useState(DEFAULT_WIFI_INTERVAL_S);
+  const [compareBaseline, setCompareBaseline] = useState(true);
 
   // The radio map is needed for the Wi-Fi layer, built once with the same
   // predicted-map approach demonstrated in Tab 2.
@@ -100,6 +102,9 @@ export default function FusionTab() {
   const ctx = useMemo(() => buildFusionContext(radioMap, ALL_APS, LEVELS), [radioMap]);
 
   const [state, setState] = useState(() => initFusionState(plan, 7, { qr: true }, ctx));
+  const [baselineState, setBaselineState] = useState(() =>
+    initFusionState(plan, 7, BASELINE_LAYERS, ctx),
+  );
 
   /**
    * Which floor is on screen. Derived during render rather than pushed into
@@ -128,6 +133,20 @@ export default function FusionTab() {
   useEffect(() => {
     if (!running) return;
     const id = setInterval(() => {
+      if (compareBaseline) {
+        setBaselineState((prev) =>
+          prev.finished
+            ? prev
+            : stepFusion(
+                prev,
+                (TICK_MS / 1000) * speed,
+                plan,
+                BASELINE_LAYERS,
+                ctx,
+                intervalRef.current,
+              ),
+        );
+      }
       setState((prev) => {
         if (prev.finished) return prev;
         const next = stepFusion(
@@ -143,15 +162,25 @@ export default function FusionTab() {
       });
     }, TICK_MS);
     return () => clearInterval(id);
-  }, [running, speed, plan, ctx]);
+  }, [running, speed, plan, ctx, compareBaseline]);
 
   const reset = useCallback(() => {
     setRunning(false);
     setState(initFusionState(plan, 7, layersRef.current, ctx));
+    setBaselineState(initFusionState(plan, 7, BASELINE_LAYERS, ctx));
     setManualLevel(1);
   }, [plan, ctx]);
 
-  const applyPreset = useCallback((preset) => setLayers(preset.layers), []);
+  const applyPreset = useCallback(
+    (preset) => {
+      setRunning(false);
+      setLayers(preset.layers);
+      layersRef.current = preset.layers;
+      setState(initFusionState(plan, 7, preset.layers, ctx));
+      setBaselineState(initFusionState(plan, 7, BASELINE_LAYERS, ctx));
+    },
+    [plan, ctx],
+  );
 
   /** The user deliberately scans a QR code — the recovery action. */
   const handleScan = useCallback(() => {
@@ -173,7 +202,11 @@ export default function FusionTab() {
   // Confidence comes from the filter's OWN spread, not from the true error.
   const confidence = confidenceLabel(state.spreadM, state.floorConfidence);
   const meanError = state.errorCount ? state.errorSum / state.errorCount : 0;
+  const baselineMeanError = baselineState.errorCount
+    ? baselineState.errorSum / baselineState.errorCount
+    : 0;
   const progress = plan.totalSeconds ? state.t / plan.totalSeconds : 0;
+  const story = storyForState(state, layers, wifiIntervalS);
 
   const activePreset = PRESETS.find(
     (p) =>
@@ -195,6 +228,41 @@ export default function FusionTab() {
     <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_380px]">
       {/* ================= MAP COLUMN ================= */}
       <div className="space-y-4">
+        <EvidenceStrip
+          proves="The fused estimator stays believable where dead reckoning alone drifts"
+          value="A synchronized orange baseline walks the same route from the same seed"
+          limitation="Simulation evidence; phone IMU and live venue trials remain future validation"
+        />
+
+        <div className={`rounded-xl border px-4 py-3 ${story.className}`} aria-live="polite">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <div className="text-[10px] font-bold uppercase tracking-[0.08em] opacity-70">
+                Live defence story
+              </div>
+              <div className="mt-0.5 text-sm font-semibold">{story.title}</div>
+            </div>
+            <Badge tone={story.tone}>{story.badge}</Badge>
+          </div>
+          <p className="mt-1 text-xs leading-relaxed opacity-90">{story.body}</p>
+        </div>
+
+        {state.truth.riding && (
+          <div className="rounded-xl border border-violet-200 bg-violet-50 p-3 text-violet-950">
+            <div className="flex items-center gap-3">
+              <div className="flex shrink-0 flex-col items-center text-[10px] font-bold">
+                <span className="rounded bg-white px-2 py-1">L1</span>
+                <span className="py-0.5">↑</span>
+                <span className="rounded bg-violet-700 px-2 py-1 text-white">L2</span>
+              </div>
+              <p className="text-xs leading-relaxed">
+                <strong>Floor transition:</strong> the step counter reports no horizontal movement,
+                so the estimate cannot discover Level 2 until radio evidence or a QR anchor changes
+                the floor hypothesis.
+              </p>
+            </div>
+          </div>
+        )}
         {/* ---- Confidence vs actual error ---- */}
         <div className="rounded-xl border border-line bg-surface p-4">
           <div className="flex flex-wrap items-end justify-between gap-4">
@@ -302,6 +370,16 @@ export default function FusionTab() {
           <p className="mt-2 text-[11px] text-ink-soft">
             Last correction: <strong className="text-ink">{state.lastCorrection}</strong>
           </p>
+
+          <label className="mt-2 inline-flex cursor-pointer items-center gap-2 text-xs font-medium text-ink-soft">
+            <input
+              type="checkbox"
+              checked={compareBaseline}
+              onChange={(event) => setCompareBaseline(event.target.checked)}
+              className="accent-brand"
+            />
+            Overlay dead-reckoning-only baseline (same route + starting seed)
+          </label>
 
           {/* Walk progress */}
           <div className="mt-3">
@@ -493,6 +571,15 @@ export default function FusionTab() {
             {/* --- Trails --- */}
             <g style={{ pointerEvents: 'none' }}>
               <TrailPath trail={state.trueTrail} level={levelNo} color="#0f172a" width={2} />
+              {compareBaseline && (
+                <TrailPath
+                  trail={baselineState.estTrail}
+                  level={levelNo}
+                  color="#ea580c"
+                  width={2.5}
+                  dashed
+                />
+              )}
               <TrailPath trail={state.estTrail} level={levelNo} color="#2563eb" width={2} dashed />
             </g>
 
@@ -555,6 +642,26 @@ export default function FusionTab() {
               </g>
             )}
 
+            {compareBaseline && baselineState.est.level === levelNo && (
+              <g style={{ pointerEvents: 'none' }}>
+                <circle
+                  cx={baselineState.est.x}
+                  cy={baselineState.est.y}
+                  r={1.25}
+                  fill="#ea580c"
+                  stroke="#ffffff"
+                  strokeWidth={2}
+                  vectorEffect="non-scaling-stroke"
+                />
+                <path
+                  d={`M ${baselineState.est.x - 1.8} ${baselineState.est.y - 1.8} L ${baselineState.est.x + 1.8} ${baselineState.est.y + 1.8} M ${baselineState.est.x + 1.8} ${baselineState.est.y - 1.8} L ${baselineState.est.x - 1.8} ${baselineState.est.y + 1.8}`}
+                  stroke="#9a3412"
+                  strokeWidth={1.5}
+                  vectorEffect="non-scaling-stroke"
+                />
+              </g>
+            )}
+
             {/* --- The true position --- */}
             {state.truth.level === levelNo && (
               <circle
@@ -593,6 +700,9 @@ export default function FusionTab() {
             <LegendItem color="#2563eb" label="Estimated position — the blue dot" />
             <LegendItem color="#2563eb" label="Particle cloud (the filter's hypotheses)" faint />
             <LegendItem color="#2563eb" label="Estimate's path" dashed />
+            {compareBaseline && (
+              <LegendItem color="#ea580c" label="DR-only baseline (same route + seed)" dashed />
+            )}
             <LegendItem color="#0f172a" label="Actual path walked" solid />
             <LegendItem color="#f59e0b" label="QR anchor (ring = scan range)" />
             <LegendItem color="#cbd5e1" label="Planned route" solid />
@@ -602,7 +712,7 @@ export default function FusionTab() {
 
         {/* ---- Session statistics ---- */}
         <Panel title="This walk" subtitle="Accumulated since the last reset">
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-5">
             <Stat label="Mean error" value={meanError.toFixed(2)} unit="m" hint="horizontal" />
             <Stat
               label="Floor correct"
@@ -652,6 +762,47 @@ export default function FusionTab() {
             />
           </div>
 
+          {compareBaseline && (
+            <div className="mt-3 grid gap-2 rounded-lg border border-orange-200 bg-orange-50 p-3 sm:grid-cols-3">
+              <Stat
+                label="Fused mean error"
+                value={meanError.toFixed(2)}
+                unit="m"
+                tone="good"
+                hint="blue estimator"
+              />
+              <Stat
+                label="DR-only mean error"
+                value={baselineMeanError.toFixed(2)}
+                unit="m"
+                tone="bad"
+                hint="orange baseline"
+              />
+              <Stat
+                label="Current gap"
+                value={Math.max(0, baselineState.currentError - state.currentError).toFixed(2)}
+                unit="m"
+                hint="baseline minus fusion"
+              />
+            </div>
+          )}
+
+          <div className="mt-3 grid gap-3 lg:grid-cols-[minmax(0,1fr)_220px]">
+            <ConfidenceTimeline points={state.confidenceTrail} />
+            <div className="grid grid-cols-2 gap-2 lg:grid-cols-1">
+              <Stat
+                label="Learned stride correction"
+                value={`${((state.learnedStrideScale - 1) * 100).toFixed(1)}%`}
+                hint="particle-weighted hypothesis"
+              />
+              <Stat
+                label="Learned heading correction"
+                value={`${((state.learnedHeadingCorrectionRad * 180) / Math.PI).toFixed(1)}°`}
+                hint="particle-weighted hypothesis"
+              />
+            </div>
+          </div>
+
           {/* Activity log — makes the invisible corrections visible. */}
           {state.events.length > 0 && (
             <div className="mt-3">
@@ -685,6 +836,7 @@ export default function FusionTab() {
       {/* ================= SIDE COLUMN ================= */}
       <div className="space-y-4">
         <ExplainerPanel
+          defaultOpen={!presentationMode}
           title="Positioning Fusion — what am I looking at?"
           whatThisIs="A shopper walking across two levels, with the app's position estimate running alongside the truth so you can see exactly where and why it goes wrong."
           concept={[
@@ -704,7 +856,7 @@ export default function FusionTab() {
               kind: 'halo',
               color: '#2563eb',
               label: 'Estimated position (the blue dot)',
-              desc: 'the weighted mean of the particle cloud — what the app believes',
+              desc: 'the centre of the densest particle cluster — what the app believes, without averaging separate corridors into a wall',
             },
             {
               kind: 'dot',
@@ -729,6 +881,12 @@ export default function FusionTab() {
               color: '#2563eb',
               label: "Estimate's path",
               desc: 'dashed blue trail — where the app thought you were. Gaps between the trails are drift',
+            },
+            {
+              kind: 'dashed',
+              color: '#ea580c',
+              label: 'Dead-reckoning-only baseline',
+              desc: 'orange trail and crossed marker — a synchronized comparison using the same route and starting seed, but no Wi-Fi or map constraints',
             },
             {
               kind: 'square',
@@ -788,7 +946,10 @@ export default function FusionTab() {
               hint="Deletes any particle that is inside a wall or crossed one to get there. Because a particle's position encodes its own error hypotheses, this implicitly deletes wrong compass guesses — so it fixes along-corridor drift too."
             />
 
-            <div className="border-t border-line pt-3">
+            <details className="border-t border-line pt-3" open={!presentationMode}>
+              <summary className="cursor-pointer text-xs font-semibold text-ink-soft">
+                Advanced fallback · manual position
+              </summary>
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <div className="text-sm font-medium text-ink">5 · Manual selection</div>
@@ -804,7 +965,7 @@ export default function FusionTab() {
                   {manualMode ? 'Click the map…' : "I'm here"}
                 </Button>
               </div>
-            </div>
+            </details>
           </div>
         </Panel>
 
@@ -862,6 +1023,108 @@ export default function FusionTab() {
 // ---------------------------------------------------------------------------
 // Sub-components
 // ---------------------------------------------------------------------------
+
+function storyForState(state, layers, wifiIntervalS) {
+  if (state.finished) {
+    return {
+      title: 'Arrival proved — now compare the two trails',
+      body: 'The blue estimate reached the destination. The orange baseline shows how much trust the constraints and periodic corrections bought over the same journey.',
+      badge: 'ARRIVED',
+      tone: 'good',
+      className: 'border-green-200 bg-green-50 text-green-950',
+    };
+  }
+  if (state.truth.riding) {
+    return {
+      title: 'The hardest moment: a floor change with no footsteps',
+      body: `Dead reckoning cannot sense the escalator. The estimator must carry uncertainty honestly until ${layers.wifi ? `the next Wi-Fi scan (up to ${wifiIntervalS} s)` : 'a QR scan'} resolves the floor.`,
+      badge: 'FLOOR TEST',
+      tone: 'warn',
+      className: 'border-violet-200 bg-violet-50 text-violet-950',
+    };
+  }
+  if (state.relocalizeCount > 0 && state.t - state.lastWifiT < 3) {
+    return {
+      title: 'Recovery, not concealment',
+      body: 'No surviving hypothesis explained the radio reading, so the filter admitted it was lost and rebuilt the cloud from the radio map.',
+      badge: 'RE-LOCALISED',
+      tone: 'good',
+      className: 'border-green-200 bg-green-50 text-green-950',
+    };
+  }
+  if (state.wrongFloor) {
+    return {
+      title: 'Visible failure: the blue dot is on the wrong level',
+      body: 'This is deliberately exposed rather than hidden. Floor correctness and horizontal error are graded separately so a plausible x/y coordinate cannot mask the wrong floor.',
+      badge: 'WRONG FLOOR',
+      tone: 'bad',
+      className: 'border-red-200 bg-red-50 text-red-950',
+    };
+  }
+  if (state.scanCount > 0 && state.t - state.lastWifiT < 2.5) {
+    return {
+      title: 'Radio correction just tightened the hypothesis cloud',
+      body: 'Wi-Fi did not draw a circle around an access point; it scored complete multi-AP fingerprints and re-weighted the particle cloud.',
+      badge: 'WI-FI UPDATE',
+      tone: 'good',
+      className: 'border-blue-200 bg-blue-50 text-blue-950',
+    };
+  }
+  return {
+    title: state.t === 0 ? 'Start the synchronized walk' : 'Coasting between corrections',
+    body:
+      state.t === 0
+        ? 'Press Start walk: blue is the layered estimator, orange is dead reckoning alone, and black is simulation truth.'
+        : 'Step and compass measurements propagate both estimates. Map constraints continuously remove impossible blue hypotheses while orange drift remains unconstrained.',
+    badge: state.t === 0 ? 'READY' : 'PREDICTION',
+    tone: 'neutral',
+    className: 'border-line bg-surface text-ink',
+  };
+}
+
+function ConfidenceTimeline({ points = [] }) {
+  const width = 420;
+  const height = 104;
+  const pad = { left: 28, right: 8, top: 10, bottom: 20 };
+  const tMax = Math.max(1, points.at(-1)?.t ?? 1);
+  const valueMax = Math.max(5, ...points.flatMap((p) => [p.spreadM, p.errorM]));
+  const x = (t) => pad.left + (t / tMax) * (width - pad.left - pad.right);
+  const y = (value) =>
+    height - pad.bottom - (value / valueMax) * (height - pad.top - pad.bottom);
+  const pathFor = (key) =>
+    points.map((p, index) => `${index ? 'L' : 'M'} ${x(p.t).toFixed(1)} ${y(p[key]).toFixed(1)}`).join(' ');
+
+  return (
+    <div className="rounded-lg border border-line bg-canvas/60 p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <div className="text-xs font-semibold text-ink">Does confidence match reality?</div>
+          <div className="text-[10px] text-ink-soft">Self-assessed spread vs simulation error</div>
+        </div>
+        <div className="flex gap-3 text-[10px] text-ink-soft">
+          <span><i className="mr-1 inline-block h-0.5 w-3 bg-brand" />confidence</span>
+          <span><i className="mr-1 inline-block h-0.5 w-3 bg-slate-900" />actual error</span>
+          <span><i className="mr-1 inline-block h-2 w-2 bg-red-200" />wrong floor</span>
+        </div>
+      </div>
+      <svg viewBox={`0 0 ${width} ${height}`} className="mt-2 block w-full" role="img" aria-label="Timeline comparing estimated uncertainty and actual positioning error">
+        <line x1={pad.left} y1={height - pad.bottom} x2={width - pad.right} y2={height - pad.bottom} stroke="#cbd5e1" />
+        <line x1={pad.left} y1={pad.top} x2={pad.left} y2={height - pad.bottom} stroke="#cbd5e1" />
+        {points.filter((p) => !p.floorCorrect).map((p, index) => (
+          <rect key={index} x={x(p.t) - 1} y={pad.top} width={2.5} height={height - pad.top - pad.bottom} fill="#fecaca" opacity={0.7} />
+        ))}
+        <path d={pathFor('spreadM')} fill="none" stroke="#2563eb" strokeWidth="2.2" vectorEffect="non-scaling-stroke" />
+        <path d={pathFor('errorM')} fill="none" stroke="#0f172a" strokeWidth="1.8" strokeDasharray="4 3" vectorEffect="non-scaling-stroke" />
+        <text x={2} y={pad.top + 4} fontSize="9" fill="#64748b">{valueMax.toFixed(0)}m</text>
+        <text x={pad.left} y={height - 4} fontSize="9" fill="#64748b">0s</text>
+        <text x={width - pad.right} y={height - 4} textAnchor="end" fontSize="9" fill="#64748b">{tMax.toFixed(0)}s</text>
+      </svg>
+      <p className="mt-1 text-[10px] leading-relaxed text-ink-soft">
+        Blue is deployable confidence; black and red use hidden ground truth only to grade whether that confidence was honest.
+      </p>
+    </div>
+  );
+}
 
 /** Draw a trail, split wherever it changes level. */
 function TrailPath({ trail, level, color, width, dashed = false }) {
