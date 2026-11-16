@@ -8,7 +8,14 @@
  */
 
 import { countWallsCrossed, dist } from '../floorplan/geometry.js';
-import { MAP_MODEL, makeRng, observeVector, predictRssi } from './wifi.js';
+import {
+  MAP_MODEL,
+  makeRng,
+  observeVector,
+  rssiFromParts,
+  deterministicApOffset,
+  correlatedFading,
+} from './wifi.js';
 
 const STOPS_PER_LEVEL = 10;
 const AVERAGED_SCANS = 8;
@@ -49,12 +56,20 @@ export function runApCalibration(levels, trueAps, realityModel = MAP_MODEL, seed
     return Float64Array.from(sums, (value) => value / AVERAGED_SCANS);
   });
 
+  // The coarse search grid and its stop-to-candidate geometry are identical for
+  // every AP and for both passes, so they are built exactly once (see
+  // buildGeometryCache for why this is the expensive part).
+  const coarse = levels.flatMap((level) =>
+    walkableGrid(level, 1.5).map((point) => ({ ...point, level: level.level })),
+  );
+  const cache = buildGeometryCache(coarse, stops, wallsByLevel);
+
   const firstPass = trueAps.map((ap, apIndex) =>
-    estimateOneAp(ap.id, apIndex, levels, stops, observations, wallsByLevel, MAP_MODEL),
+    estimateOneAp(ap.id, apIndex, cache, stops, observations, wallsByLevel, MAP_MODEL),
   );
   const fitted = fitGlobalParameters(firstPass, stops, observations, wallsByLevel, MAP_MODEL);
   const estimatedAps = trueAps.map((ap, apIndex) =>
-    estimateOneAp(ap.id, apIndex, levels, stops, observations, wallsByLevel, fitted),
+    estimateOneAp(ap.id, apIndex, cache, stops, observations, wallsByLevel, fitted),
   );
 
   const estimates = estimatedAps.map((estimated, index) => {
@@ -84,11 +99,87 @@ export function runApCalibration(levels, trueAps, realityModel = MAP_MODEL, seed
   };
 }
 
-function estimateOneAp(id, apIndex, levels, stops, observations, wallsByLevel, model) {
-  const coarse = levels.flatMap((level) =>
-    walkableGrid(level, 1.5).map((point) => ({ ...point, level: level.level })),
-  );
-  let best = scoreCandidates(coarse, id, apIndex, stops, observations, wallsByLevel, model);
+/**
+ * Precompute the geometry between every coarse candidate AP position and every
+ * calibration stop: log-distance, walls crossed, floors crossed.
+ *
+ * WHY: wall counting dominates the cost of calibration. The coarse search scores
+ * ~960 candidate positions against 30 stops, for each of 18 APs, twice — about a
+ * million predictions, each intersecting a line against ~80 wall segments. But
+ * the number of walls between a stop and a candidate position depends only on
+ * the building, not on which AP is being fitted or on the model parameters. So
+ * it is computed once here (~29k wall counts) and every later score becomes
+ * pure arithmetic.
+ *
+ * The cached formula below must stay identical to `predictRssi` in wifi.js; the
+ * test suite checks that the optimised calibration reproduces the unoptimised
+ * result exactly.
+ */
+function buildGeometryCache(candidates, stops, wallsByLevel) {
+  const size = candidates.length * stops.length;
+  const logD = new Float64Array(size);
+  const walls = new Float64Array(size);
+  const floors = new Float64Array(size);
+  candidates.forEach((candidate, c) => {
+    stops.forEach((stop, i) => {
+      const k = c * stops.length + i;
+      logD[k] = Math.log10(Math.max(1, dist(stop, candidate)));
+      walls[k] = countWallsCrossed(stop, candidate, wallsByLevel.get(stop.level) ?? []);
+      floors[k] = Math.abs(candidate.level - stop.level);
+    });
+  });
+  return { candidates, logD, walls, floors, stopCount: stops.length };
+}
+
+/**
+ * Terms that depend on the AP and the stop but never on the candidate position
+ * (the per-AP transmit offset and the spatially-correlated fading). Evaluated
+ * once per stop per fit, rather than once per (candidate, stop) pair.
+ */
+function perStopTerms(id, stops, model) {
+  const apOffset = deterministicApOffset(id) * (model.apOffsetScaleDb ?? 0);
+  return stops.map((stop) => ({
+    apOffset,
+    fading: correlatedFading(stop, stop.level, id, model.fadingAmplitudeDb ?? 0),
+  }));
+}
+
+/**
+ * Best coarse candidate for one AP, scored from the geometry cache.
+ *
+ * A score is a sum of squares, so it only ever grows. Once a candidate's partial
+ * score reaches the best complete score so far it cannot win, and the rest of
+ * its stops are skipped. Ties still go to the earliest candidate (strict `<`),
+ * so this changes the speed and nothing else.
+ */
+function scoreCached(cache, id, apIndex, stops, observations, model) {
+  const terms = perStopTerms(id, stops, model);
+  const { candidates, logD, walls, floors, stopCount } = cache;
+  let winner = { ...candidates[0], score: Infinity };
+  for (let c = 0; c < candidates.length; c++) {
+    let score = 0;
+    const base = c * stopCount;
+    for (let i = 0; i < stopCount; i++) {
+      const k = base + i;
+      const predicted = rssiFromParts(
+        logD[k],
+        walls[k],
+        floors[k],
+        terms[i].apOffset,
+        terms[i].fading,
+        model,
+      );
+      const delta = observations[i][apIndex] - predicted;
+      score += delta * delta;
+      if (score >= winner.score) break;
+    }
+    if (score < winner.score) winner = { ...candidates[c], score };
+  }
+  return winner;
+}
+
+function estimateOneAp(id, apIndex, cache, stops, observations, wallsByLevel, model) {
+  let best = scoreCached(cache, id, apIndex, stops, observations, model);
 
   const refinement = [];
   for (let dx = -1.5; dx <= 1.5; dx += 0.25) {
@@ -100,15 +191,29 @@ function estimateOneAp(id, apIndex, levels, stops, observations, wallsByLevel, m
   return { id, x: best.x, y: best.y, level: best.level };
 }
 
+/**
+ * Fine refinement around the coarse winner. These candidates are different for
+ * every AP, so there is nothing to cache — instead, wall crossings are counted
+ * lazily and the same early exit skips them for any candidate already beaten.
+ */
 function scoreCandidates(candidates, id, apIndex, stops, observations, wallsByLevel, model) {
+  const terms = perStopTerms(id, stops, model);
   let winner = { ...candidates[0], score: Infinity };
   for (const candidate of candidates) {
-    const ap = { id, ...candidate };
     let score = 0;
     for (let i = 0; i < stops.length; i++) {
-      const predicted = predictRssi(stops[i], stops[i].level, ap, wallsByLevel, model);
+      const stop = stops[i];
+      const predicted = rssiFromParts(
+        Math.log10(Math.max(1, dist(stop, candidate))),
+        countWallsCrossed(stop, candidate, wallsByLevel.get(stop.level) ?? []),
+        Math.abs(candidate.level - stop.level),
+        terms[i].apOffset,
+        terms[i].fading,
+        model,
+      );
       const delta = observations[i][apIndex] - predicted;
       score += delta * delta;
+      if (score >= winner.score) break;
     }
     if (score < winner.score) winner = { ...candidate, score };
   }

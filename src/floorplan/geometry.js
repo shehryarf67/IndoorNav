@@ -127,11 +127,42 @@ export function segmentsIntersect(p1, p2, p3, p4) {
  * @returns {number} count of walls crossed
  */
 export function countWallsCrossed(a, b, walls) {
+  // This is the hottest function in the whole app: the radio map, the heatmap,
+  // every batch test, AP calibration and the particle filter's map matching all
+  // call it, often millions of times. It is therefore written on plain numbers
+  // rather than through segmentsIntersect():
+  //
+  //  - the obvious version allocated two point objects per wall per call, which
+  //    showed up as ~13% of calibration time spent in the garbage collector;
+  //  - callers pass points of many different object shapes (stops, APs,
+  //    particles, candidates), and after a few runs V8 stopped specialising the
+  //    shared helpers and the same calibration ran ~4x slower.
+  //
+  // The arithmetic is exactly orientation() / segmentsIntersect() above, so the
+  // answer is identical — the test suite checks it against segmentsIntersect.
+  const ax = a.x;
+  const ay = a.y;
+  const bx = b.x;
+  const by = b.y;
   let n = 0;
-  for (const w of walls) {
-    if (segmentsIntersect(a, b, { x: w.x1, y: w.y1 }, { x: w.x2, y: w.y2 })) n++;
+  for (let i = 0; i < walls.length; i++) {
+    const w = walls[i];
+    const o1 = orient(ax, ay, bx, by, w.x1, w.y1);
+    const o2 = orient(ax, ay, bx, by, w.x2, w.y2);
+    if (o1 === 0 || o2 === 0 || o1 === o2) continue;
+    const o3 = orient(w.x1, w.y1, w.x2, w.y2, ax, ay);
+    const o4 = orient(w.x1, w.y1, w.x2, w.y2, bx, by);
+    if (o3 === 0 || o4 === 0 || o3 === o4) continue;
+    n++;
   }
   return n;
+}
+
+/** orientation() on scalars, so the hot path never allocates. */
+function orient(ax, ay, bx, by, cx, cy) {
+  const v = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+  if (Math.abs(v) < 1e-12) return 0;
+  return v > 0 ? 1 : -1;
 }
 
 /** Length of a wall segment, in metres. */

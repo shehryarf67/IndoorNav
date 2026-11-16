@@ -123,9 +123,21 @@ export function predictRssi(point, level, ap, wallsByLevel, model) {
   const apOffset = deterministicApOffset(ap.id) * (model.apOffsetScaleDb ?? 0);
   const fading = correlatedFading(point, level, ap.id, model.fadingAmplitudeDb ?? 0);
 
+  return rssiFromParts(Math.log10(d), walls, floors, apOffset, fading, model);
+}
+
+/**
+ * The propagation formula itself, from precomputed geometry.
+ *
+ * Split out of `predictRssi` so that code which caches the expensive geometric
+ * terms (log-distance and wall counts — see apCalibration.js) evaluates EXACTLY
+ * the same arithmetic, in the same order, and therefore gets bit-identical
+ * results. Keep this the single place the formula is written down.
+ */
+export function rssiFromParts(log10D, walls, floors, apOffset, fading, model) {
   const rssi =
     model.p0 -
-    10 * model.n * Math.log10(d) -
+    10 * model.n * log10D -
     walls * model.wallLossDb -
     floors * model.floorLossDb -
     model.crowdOffsetDb +
