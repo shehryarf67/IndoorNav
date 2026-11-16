@@ -1,5 +1,12 @@
 import { useCallback, useMemo, useState } from 'react';
-import { LEVELS, ALL_APS, getLevel, isWalkable, BUILDING } from '../floorplan/floorplan.js';
+import {
+  LEVELS,
+  ALL_APS,
+  getLevel,
+  isWalkable,
+  BUILDING,
+  GROUND_LEVEL,
+} from '../floorplan/floorplan.js';
 import { countWallsCrossed, dist } from '../floorplan/geometry.js';
 import {
   MAP_MODEL,
@@ -21,6 +28,13 @@ import { RSSI_BANDS, ERROR_BANDS, rssiColor, errorColor } from '../lib/signalCol
 import FloorPlanSvg from '../components/FloorPlanSvg.jsx';
 import ExplainerPanel from '../components/ExplainerPanel.jsx';
 import { Panel, Button, Stat, Select, Slider, Badge, EvidenceStrip } from '../components/ui.jsx';
+
+/**
+ * The AP shown by default: the first one on the ground floor. Not ALL_APS[0] —
+ * levels are ordered bottom-up, so that would be a car-park AP seen through the
+ * floor slab, which is a confusing first picture.
+ */
+const DEFAULT_AP = ALL_APS.find((ap) => ap.level === GROUND_LEVEL) ?? ALL_APS[0];
 
 /**
  * TAB 2 — Wi-Fi Positioning
@@ -80,7 +94,7 @@ export default function WifiPositioningTab({ presentationMode = false }) {
   const [radioMap, setRadioMap] = useState(null);
   const [levelNo, setLevelNo] = useState(1);
   const [view, setView] = useState('coverage');
-  const [selectedApId, setSelectedApId] = useState(ALL_APS[0].id);
+  const [selectedApId, setSelectedApId] = useState(DEFAULT_AP.id);
   const [truePoint, setTruePoint] = useState(null);
   const [batch, setBatch] = useState(null);
   const [batchMs, setBatchMs] = useState(null);
@@ -218,7 +232,7 @@ export default function WifiPositioningTab({ presentationMode = false }) {
 
   const selectedAp = ALL_APS.find((a) => a.id === selectedApId);
   const wallExample = useMemo(
-    () => findWallFailureExample(level, selectedAp ?? ALL_APS[0], radioMap?.wallsByLevel),
+    () => findWallFailureExample(level, selectedAp ?? DEFAULT_AP, radioMap?.wallsByLevel),
     [level, selectedAp, radioMap],
   );
 

@@ -218,7 +218,7 @@ export default function MapBuilderTab({ presentationMode = false }) {
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="inline-flex rounded-lg border border-line bg-surface p-0.5" aria-label="Floor-plan scenario">
             {[
-              ['mall', 'Main mall · two levels'],
+              ['mall', `Main mall · ${LEVELS.length} levels`],
               ['annex', 'Unseen annex · irregular'],
             ].map(([id, label]) => (
               <button
@@ -460,13 +460,22 @@ export default function MapBuilderTab({ presentationMode = false }) {
 
                 {/* --- Cross-level hand-off marker --- */}
                 {inspectStage === 'route' && route?.transports.map((t) => {
+                  // A connector appears on the floor you board on ("go to L2")
+                  // and the floor you arrive on ("arrived from P"). Driven by
+                  // the direction the route actually rode it, so this works for
+                  // any number of floors.
+                  const boarding = t.fromLevel === levelNo;
+                  const arriving = t.toLevel === levelNo;
+                  if (!boarding && !arriving) return null;
                   const linkNode = graph.nodes.find(
-                    (n) => n.kind === 'link' && n.label === t.label && n.level === levelNo,
+                    (n) => n.kind === 'link' && n.linkId === t.connectorId && n.level === levelNo,
                   );
                   if (!linkNode) return null;
-                  const otherLevel = levelNo === 1 ? 2 : 1;
+                  const tag = boarding
+                    ? `${t.label} → ${levelShort(t.toLevel)}`
+                    : `Arrived from ${levelShort(t.fromLevel)}`;
                   return (
-                    <g key={t.id} style={{ pointerEvents: 'none' }}>
+                    <g key={`${t.id}-${levelNo}`} style={{ pointerEvents: 'none' }}>
                       <circle
                         cx={linkNode.x}
                         cy={linkNode.y}
@@ -493,7 +502,7 @@ export default function MapBuilderTab({ presentationMode = false }) {
                         fill="#ffffff"
                         fontWeight={600}
                       >
-                        {t.label} → Level {otherLevel}
+                        {tag}
                       </text>
                     </g>
                   );
@@ -653,7 +662,7 @@ export default function MapBuilderTab({ presentationMode = false }) {
                       Level change
                     </div>
                     <div className="mt-0.5 text-xs font-medium text-ink">
-                      {describeTransports(route)}
+                      {describeTransports(route, levelShort)}
                     </div>
                     {/* Quantify what accessibility costs — an honest trade-off,
                         not a hidden one. */}
@@ -667,7 +676,7 @@ export default function MapBuilderTab({ presentationMode = false }) {
                         <strong className="tnum text-ink">
                           {Math.round(route.seconds - defaultRoute.seconds)} s
                         </strong>{' '}
-                        vs the fastest route ({describeTransports(defaultRoute)}).
+                        vs the fastest route ({describeTransports(defaultRoute, levelShort)}).
                       </div>
                     )}
                   </div>
@@ -690,7 +699,7 @@ export default function MapBuilderTab({ presentationMode = false }) {
                           }`}
                         >
                           <span>
-                            Leg {i + 1} — Level {run.level}
+                            Leg {i + 1} — {levelShort(run.level)}
                           </span>
                           <span className="tnum">
                             {runLength(run.points).toFixed(1)} m
@@ -810,6 +819,12 @@ function runLength(points) {
 }
 
 /** "1 min 25 s" style duration. */
+/** Short floor name for markers and summaries ("P", "L1", "L2"). */
+function levelShort(level) {
+  const found = LEVELS.find((l) => l.level === level);
+  return found?.shortName ?? `Level ${level}`;
+}
+
 function formatDuration(seconds) {
   const s = Math.round(seconds);
   if (s < 60) return `${s} s`;

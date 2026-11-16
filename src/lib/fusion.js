@@ -124,8 +124,8 @@ export const QR_RADIUS_M = 1.8;
 export const WALK_ROUTE = [
   { x: 3, y: 20, level: 1, note: 'West entrance' },
   { x: 30, y: 20, level: 1, note: 'Central atrium' },
-  { x: 30, y: 9, level: 1, note: 'Escalator (Level 1)' },
-  { x: 30, y: 9, level: 2, note: 'Escalator (Level 2)' }, // level change = ride
+  { x: 28.2, y: 9, level: 1, note: 'Up-escalator (Level 1)' },
+  { x: 28.2, y: 9, level: 2, note: 'Up-escalator (Level 2)' }, // level change = ride
   { x: 30, y: 20, level: 2, note: 'Level 2 atrium' },
   { x: 44.83, y: 20, level: 2, note: 'East concourse' },
   { x: 44.83, y: 15.5, level: 2, note: 'Metro Shoes' },

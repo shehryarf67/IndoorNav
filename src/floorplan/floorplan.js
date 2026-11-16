@@ -293,50 +293,109 @@ function buildWalls(shops) {
 }
 
 // ---------------------------------------------------------------------------
-// Vertical circulation (shared between the two levels)
+// Floors and vertical circulation
 // ---------------------------------------------------------------------------
 
 /**
- * Escalator, stairs and lift. Each exists at the same (x, y) on both levels,
- * which is how the navigation graph stitches the two floors into one network.
- *
- * `costM` is the routing cost expressed as an equivalent walking distance in
- * metres, so A* can trade "take the stairs" against "walk round to the lift"
- * on a single scale. The lift is expensive (call + wait) and deliberately sits
- * far east, so the accessible route is visibly longer.
+ * Storey height in metres. Floors are stacked at multiples of this, which is
+ * what lets anything — routing time, a barometer, a renderer — reason about how
+ * far apart two floors are.
  */
-export const VERTICAL_LINKS = [
+export const FLOOR_HEIGHT_M = 4.5;
+
+/**
+ * Connectors: the escalators, stairs and lifts that join floors.
+ *
+ * Each connector is a first-class object rather than an implicit "this spot
+ * exists on both floors", because real vertical circulation has properties the
+ * routing MUST respect:
+ *
+ *  - `servesLevels`  Which floors it actually stops at. The lift and stairs
+ *                     reach the car park; the escalators do not. Malls really are
+ *                     built this way, and it is what makes routing to the car
+ *                     park non-trivial.
+ *  - `direction`     `up`, `down` or `both`. An escalator moves one way, so
+ *                     the up and down escalators are two separate connectors
+ *                     side by side. Treating one escalator as two-way was a real
+ *                     bug in the first version of this demo.
+ *  - `waitS`,       Time costs. A ride costs `waitS + secondsPerFloor × floors`,
+ *    `secondsPerFloor` so a lift's wait is paid once per ride, not per floor.
+ *                     Routing cost is derived from this time, so the route the
+ *                     algorithm picks and the time it reports can never disagree.
+ *  - `accessible`    Step-free. Only the lift is.
+ *  - `inService`     A broken lift is removed from routing without rebuilding
+ *                     the graph.
+ *
+ * Positions are where the connector sits on every floor it serves (the same
+ * (x, y) everywhere: a stair core or lift shaft is vertically continuous).
+ */
+export const CONNECTORS = [
   {
-    id: 'escalator',
+    id: 'escalator-up',
     type: 'escalator',
-    label: 'Escalator',
-    x: CORRIDOR_AXES.vX,
+    label: 'Up-escalator',
+    shortLabel: 'Esc ↑',
+    x: 28.2,
     y: 9,
+    servesLevels: [1, 2],
+    direction: 'up',
+    waitS: 0,
+    secondsPerFloor: 22,
     accessible: false,
-    costM: 14,
-    seconds: 22,
+    inService: true,
+  },
+  {
+    id: 'escalator-down',
+    type: 'escalator',
+    label: 'Down-escalator',
+    shortLabel: 'Esc ↓',
+    x: 31.8,
+    y: 9,
+    servesLevels: [1, 2],
+    direction: 'down',
+    waitS: 0,
+    secondsPerFloor: 22,
+    accessible: false,
+    inService: true,
   },
   {
     id: 'stairs',
     type: 'stairs',
     label: 'Stairs',
+    shortLabel: 'Stairs',
     x: CORRIDOR_AXES.vX,
     y: 31,
+    servesLevels: [0, 1, 2],
+    direction: 'both',
+    waitS: 0,
+    secondsPerFloor: 30,
     accessible: false,
-    costM: 16,
-    seconds: 30,
+    inService: true,
   },
   {
+    // The lift deliberately sits far east, so the step-free route is visibly
+    // longer than the escalator route — that is what the accessibility toggle
+    // is there to show.
     id: 'lift',
     type: 'lift',
     label: 'Lift',
+    shortLabel: 'Lift',
     x: 50,
     y: CORRIDOR_AXES.hY,
+    servesLevels: [0, 1, 2],
+    direction: 'both',
+    waitS: 35,
+    secondsPerFloor: 10,
     accessible: true,
-    costM: 24,
-    seconds: 55,
+    inService: true,
   },
 ];
+
+/**
+ * Kept as an alias so existing imports (tests, the alternate plan) keep working.
+ * New code should use `CONNECTORS`.
+ */
+export const VERTICAL_LINKS = CONNECTORS;
 
 // ---------------------------------------------------------------------------
 // Wi-Fi access points
@@ -352,6 +411,15 @@ export const VERTICAL_LINKS = [
  * that Tab 2's error map is meant to expose.
  */
 const APS_BY_LEVEL = {
+  // The car park gets only four APs. Basements are characteristically sparse —
+  // Wi-Fi is installed for shoppers, not for cars — so positioning down here is
+  // deliberately harder, as it would be in a real building.
+  0: [
+    { id: 'AP15', x: 8, y: 20 },
+    { id: 'AP16', x: 30, y: 21 },
+    { id: 'AP17', x: 52, y: 19 },
+    { id: 'AP18', x: 30, y: 33 },
+  ],
   1: [
     { id: 'AP1', x: 5, y: 18 },
     { id: 'AP2', x: 17, y: 21 },
@@ -375,6 +443,38 @@ const APS_BY_LEVEL = {
 // ---------------------------------------------------------------------------
 // Tenants
 // ---------------------------------------------------------------------------
+
+/**
+ * Level P: the basement car park.
+ *
+ * Simplification worth stating: the parking zones reuse the same strip geometry
+ * and walls as the shop floors above. A real car park is mostly open, with
+ * columns rather than partition walls, so radio propagation down here is
+ * pessimistic in this model. What it does model faithfully is the thing that
+ * matters for navigation — that only the lift and stairs reach it.
+ */
+const LEVEL_0_STRIPS = {
+  nwH: [{ name: 'Parking Zone A', category: 'parking' }],
+  nwV: [
+    { name: 'Plant Room', category: 'services' },
+    { name: 'Security Office', category: 'services' },
+  ],
+  neV: [
+    { name: 'EV Charging', category: 'parking' },
+    { name: 'Valet Desk', category: 'services' },
+  ],
+  neH: [{ name: 'Parking Zone B', category: 'parking' }],
+  swH: [{ name: 'Parking Zone C', category: 'parking' }],
+  swV: [
+    { name: 'Motorbike Bay', category: 'parking' },
+    { name: 'Loading Dock', category: 'services' },
+  ],
+  seV: [
+    { name: 'Car Wash', category: 'services' },
+    { name: 'Taxi Pickup', category: 'parking' },
+  ],
+  seH: [{ name: 'Parking Zone D', category: 'parking' }],
+};
 
 /** Level 1: fashion and general retail, with a supermarket anchor. */
 const LEVEL_1_STRIPS = {
@@ -453,41 +553,62 @@ const LEVEL_2_STRIPS = {
 
 /**
  * Build one complete level: shops, walls, walkable rectangles, centrelines,
- * access points and the vertical links that touch it.
+ * access points and the connectors that stop on it.
  *
- * @param {number} level 1 or 2
+ * @param {{level:number, ordinal:number, name:string, shortName:string}} meta
+ *   `level` is the identifier used everywhere else in the code; `ordinal` is
+ *   its position in the stack (0 = car park, 1 = ground, 2 = first floor).
+ *   They are equal in this building, but kept separate deliberately: real
+ *   buildings number floors inconsistently ("G", "M" for mezzanine, "LG"), and
+ *   anything that reasons about up/down must use the ordinal, never the label.
  * @param {Record<string, object[]>} stripSpec tenant list per strip
- * @param {string} name human-readable level name
  */
-function buildLevel(level, stripSpec, name) {
+function buildLevel(meta, stripSpec) {
+  const { level, ordinal, name, shortName } = meta;
   const shops = Object.entries(stripSpec)
     .flatMap(([stripKey, units]) => buildStrip(stripKey, units))
     .map((shop) => ({ ...shop, level }));
 
   return {
     level,
+    ordinal,
+    /** Floor height above the ground floor, in metres (negative = below). */
+    elevationM: (ordinal - 1) * FLOOR_HEIGHT_M,
     id: `level-${level}`,
     name,
+    shortName,
     shops,
     walls: buildWalls(shops),
     /** Walkable regions. `isWalkable()` tests a point against these. */
     corridors: CORRIDOR_RECTS.map((r) => ({ ...r })),
     centrelines: CENTRELINES.map((c) => ({ ...c })),
     aps: APS_BY_LEVEL[level].map((ap) => ({ ...ap, level })),
-    /** Vertical links are shared, but each level needs them for rendering. */
-    verticalLinks: VERTICAL_LINKS.map((v) => ({ ...v })),
+    /** Only the connectors that actually stop on this floor. */
+    verticalLinks: CONNECTORS.filter((c) => c.servesLevels.includes(level)).map((c) => ({
+      ...c,
+    })),
   };
 }
 
-/** The two levels, index 0 = Level 1 (ground). */
+/**
+ * Every level, bottom to top. Order matters: floor pickers, the barometer and
+ * the routing heuristic all assume this list is sorted by ordinal.
+ */
 export const LEVELS = [
-  buildLevel(1, LEVEL_1_STRIPS, 'Level 1 — Ground'),
-  buildLevel(2, LEVEL_2_STRIPS, 'Level 2 — Food & Cinema'),
+  buildLevel({ level: 0, ordinal: 0, name: 'Level P — Parking', shortName: 'P' }, LEVEL_0_STRIPS),
+  buildLevel({ level: 1, ordinal: 1, name: 'Level 1 — Ground', shortName: 'L1' }, LEVEL_1_STRIPS),
+  buildLevel(
+    { level: 2, ordinal: 2, name: 'Level 2 — Food & Cinema', shortName: 'L2' },
+    LEVEL_2_STRIPS,
+  ),
 ];
 
-/** Convenience lookup: level number (1-based) -> level object. */
+/** The ground floor — where a visitor arrives, and the sensible default view. */
+export const GROUND_LEVEL = 1;
+
+/** Convenience lookup: level identifier -> level object (falls back to ground). */
 export function getLevel(level) {
-  return LEVELS.find((l) => l.level === level) ?? LEVELS[0];
+  return LEVELS.find((l) => l.level === level) ?? LEVELS.find((l) => l.level === GROUND_LEVEL);
 }
 
 /** Every access point on every level, flattened — used by Tab 2's radio map. */
@@ -559,4 +680,5 @@ export const CATEGORY_COLORS = {
   entertainment: '#ede9fe',
   electronics: '#e0f2fe',
   services: '#f1f5f9',
+  parking: '#f5f5f4',
 };

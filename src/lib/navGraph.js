@@ -214,27 +214,56 @@ export function buildNavGraph(levels, verticalLinks) {
 
   // --- Step 6: stitch the levels together ----------------------------------
   //
-  // Each vertical link becomes one edge between its Level 1 and Level 2 nodes.
-  // `cost` is an equivalent-walking-distance so A* can weigh "take the stairs"
-  // against "walk to the lift" on a single scale, while `distanceM` stays 0
-  // because you are not walking horizontally — that keeps the route's distance
+  // A connector that stops on N floors gets an edge for EVERY pair of floors it
+  // serves, not just neighbouring ones. That is what makes a lift ride from the
+  // car park to Level 2 cost one wait plus two floors of travel, rather than two
+  // waits (which is what chaining P->1->2 edges would charge).
+  //
+  // Cost is DERIVED from time: (wait + seconds per floor x floors) converted to
+  // an equivalent walking distance. One number therefore drives both what A*
+  // optimises and the time the route reports, so the two can never disagree.
+  // `distanceM` stays 0 because riding is not walking, which keeps the distance
   // readout honest.
+  const ordinalByLevel = new Map(levels.map((l) => [l.level, l.ordinal ?? l.level]));
+
   for (const link of verticalLinks) {
-    const a = linkNodeIds.get(`${link.id}@1`);
-    const b = linkNodeIds.get(`${link.id}@2`);
-    if (!a || !b) continue;
-    edges.push({
-      id: `${a}~${b}`,
-      from: a,
-      to: b,
-      cost: link.costM,
-      distanceM: 0,
-      kind: 'vertical',
-      transport: link.type,
-      seconds: link.seconds,
-      accessible: link.accessible,
-      label: link.label,
-    });
+    const served = (link.servesLevels ?? levels.map((l) => l.level))
+      .filter((lvl) => linkNodeIds.has(`${link.id}@${lvl}`))
+      .sort((p, q) => ordinalByLevel.get(p) - ordinalByLevel.get(q));
+
+    for (let i = 0; i < served.length; i++) {
+      for (let j = i + 1; j < served.length; j++) {
+        const lower = served[i];
+        const upper = served[j];
+        const floors = Math.abs(ordinalByLevel.get(upper) - ordinalByLevel.get(lower));
+        const seconds = (link.waitS ?? 0) + (link.secondsPerFloor ?? 20) * floors;
+        const lowerId = linkNodeIds.get(`${link.id}@${lower}`);
+        const upperId = linkNodeIds.get(`${link.id}@${upper}`);
+
+        // An escalator moves one way. Its edge is DIRECTED, and stored only in
+        // the adjacency list of the floor you board on, so the search simply
+        // cannot see it from the other end.
+        const direction = link.direction ?? 'both';
+        const [from, to] = direction === 'down' ? [upperId, lowerId] : [lowerId, upperId];
+
+        edges.push({
+          id: `${from}~${to}`,
+          from,
+          to,
+          cost: seconds * WALK_SPEED_MPS,
+          distanceM: 0,
+          kind: 'vertical',
+          directed: direction !== 'both',
+          transport: link.type,
+          connectorId: link.id,
+          floors,
+          seconds,
+          accessible: !!link.accessible,
+          inService: link.inService !== false,
+          label: link.label,
+        });
+      }
+    }
   }
 
   // --- Index for fast lookup during search ---------------------------------
@@ -242,7 +271,8 @@ export function buildNavGraph(levels, verticalLinks) {
   const adjacency = new Map(nodes.map((n) => [n.id, []]));
   for (const e of edges) {
     adjacency.get(e.from).push(e);
-    adjacency.get(e.to).push(e); // undirected: corridors walk both ways
+    // Corridors, stairs and lifts work both ways; escalators do not.
+    if (!e.directed) adjacency.get(e.to).push(e);
   }
 
   return {
@@ -255,7 +285,9 @@ export function buildNavGraph(levels, verticalLinks) {
       edgeCount: edges.length,
       totalEdgeMetres: edges.reduce((s, e) => s + e.distanceM, 0),
       levelCount: levels.length,
+      connectorEdgeCount: edges.filter((e) => e.kind === 'vertical').length,
     },
+    ordinalByLevel,
   };
 }
 
@@ -296,56 +328,145 @@ function centrelineCrossing(a, b) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Route profiles. Each is just a rule about which connector edges may be used —
+ * corridors are always allowed.
+ *
+ *  - fastest            anything in service
+ *  - step-free          lifts only: wheelchairs, prams, heavy luggage
+ *  - avoid-escalators   lifts and stairs: trolleys, very young children
+ */
+export const ROUTE_PROFILES = {
+  fastest: { label: 'Fastest', allow: () => true },
+  'step-free': { label: 'Step-free', allow: (e) => e.accessible },
+  'avoid-escalators': { label: 'Avoid escalators', allow: (e) => e.transport !== 'escalator' },
+};
+
+/**
+ * Minimal binary min-heap keyed on `f`.
+ *
+ * The first version of this file used a sorted array as the frontier, because
+ * it was short enough to read aloud. With three floors the graph is larger, and
+ * the test suite now routes every pair of shops, so re-sorting the whole
+ * frontier on every pop became the dominant cost. A heap makes each pop
+ * O(log n) instead of O(n log n).
+ */
+class MinHeap {
+  constructor() {
+    this.items = [];
+  }
+
+  get size() {
+    return this.items.length;
+  }
+
+  push(item) {
+    const a = this.items;
+    a.push(item);
+    let i = a.length - 1;
+    while (i > 0) {
+      const parent = (i - 1) >> 1;
+      if (a[parent].f <= a[i].f) break;
+      [a[parent], a[i]] = [a[i], a[parent]];
+      i = parent;
+    }
+  }
+
+  pop() {
+    const a = this.items;
+    const top = a[0];
+    const last = a.pop();
+    if (a.length > 0) {
+      a[0] = last;
+      let i = 0;
+      for (;;) {
+        const l = 2 * i + 1;
+        const r = l + 1;
+        let m = i;
+        if (l < a.length && a[l].f < a[m].f) m = l;
+        if (r < a.length && a[r].f < a[m].f) m = r;
+        if (m === i) break;
+        [a[m], a[i]] = [a[i], a[m]];
+        i = m;
+      }
+    }
+    return top;
+  }
+}
+
+/**
  * A* search over the navigation graph.
  *
  * A* is Dijkstra plus a heuristic: at each step it expands the node with the
- * lowest (cost so far + optimistic estimate of cost remaining). The estimate
- * here is straight-line distance to the destination, plus — if the destination
- * is on another level — the cheapest vertical link available. Both terms are
- * guaranteed never to overestimate the true remaining cost, which is what makes
- * A* provably return the shortest path rather than merely a short one.
+ * lowest (cost so far + optimistic estimate of cost remaining). Here the
+ * estimate is
+ *
+ *     straight-line distance  +  |floors apart| x (cheapest cost per floor)
+ *
+ * Neither term can overestimate. The walk can be no shorter than a straight
+ * line, because every connector sits at the same (x, y) on every floor it
+ * serves. And any sequence of rides covering k floors costs at least k times
+ * the cheapest per-floor cost available. That admissibility is what makes A*
+ * provably return the shortest path rather than merely a short one — and the
+ * test suite checks it against plain Dijkstra on every pair of shops.
  *
  * @param {object} graph result of buildNavGraph
  * @param {string} startId
  * @param {string} goalId
- * @param {{ accessibleOnly?: boolean }} options when accessibleOnly is true,
- *   stairs and escalators are removed from the graph and only the lift is used.
- * @returns {null | { nodeIds: string[], edges: NavEdge[], distanceM: number, seconds: number, transports: object[], visitedCount: number }}
+ * @param {{ profile?: string, accessibleOnly?: boolean, disabledConnectors?: Iterable<string>, heuristic?: boolean }} options
+ *   `profile` is a key of ROUTE_PROFILES; `accessibleOnly` is kept as shorthand
+ *   for the step-free profile. `disabledConnectors` lists connector ids that are
+ *   out of service right now. `heuristic: false` turns A* into Dijkstra, which
+ *   the tests use as the reference answer.
+ * @returns {null | { nodeIds: string[], edges: NavEdge[], distanceM: number, seconds: number, transports: object[], profile: string, visitedCount: number }}
  */
 export function findRoute(graph, startId, goalId, options = {}) {
-  const { accessibleOnly = false } = options;
+  const profileKey = options.accessibleOnly ? 'step-free' : (options.profile ?? 'fastest');
+  const profile = ROUTE_PROFILES[profileKey] ?? ROUTE_PROFILES.fastest;
+  const disabled = new Set(options.disabledConnectors ?? []);
+  const useHeuristic = options.heuristic !== false;
   const { nodeById, adjacency } = graph;
   if (!nodeById.has(startId) || !nodeById.has(goalId)) return null;
 
-  // The cheapest vertical link still permitted — used by the heuristic.
-  const cheapestVertical = Math.min(
-    ...graph.edges
-      .filter((e) => e.kind === 'vertical' && (!accessibleOnly || e.accessible))
-      .map((e) => e.cost),
-    Infinity,
-  );
+  /**
+   * The one rule deciding whether an edge exists for this query. Removing edges
+   * rather than penalising them is deliberate: an inaccessible or broken
+   * connector is not "expensive", it is unusable.
+   */
+  const usable = (edge) => {
+    if (edge.kind !== 'vertical') return true;
+    if (edge.inService === false || disabled.has(edge.connectorId)) return false;
+    return profile.allow(edge);
+  };
+
+  const ordinal = (node) => graph.ordinalByLevel?.get(node.level) ?? node.level;
+
+  // Cheapest cost per floor among the connectors this query is allowed to use.
+  let perFloor = Infinity;
+  for (const e of graph.edges) {
+    if (e.kind === 'vertical' && usable(e)) {
+      perFloor = Math.min(perFloor, e.cost / (e.floors || 1));
+    }
+  }
+  if (!Number.isFinite(perFloor)) perFloor = 0;
 
   const goal = nodeById.get(goalId);
+  const goalOrdinal = ordinal(goal);
   const heuristic = (node) => {
+    if (!useHeuristic) return 0;
     const flat = Math.hypot(node.x - goal.x, node.y - goal.y);
-    const floorPenalty = node.level === goal.level ? 0 : cheapestVertical;
-    return flat + floorPenalty;
+    return flat + Math.abs(ordinal(node) - goalOrdinal) * perFloor;
   };
 
   const gScore = new Map([[startId, 0]]);
   const cameFrom = new Map();
   const closed = new Set();
-
-  // A binary heap would be asymptotically better, but this graph has ~150 nodes.
-  // A sorted-array frontier keeps the code short enough to read aloud, and the
-  // whole search finishes in well under a millisecond.
-  const open = [{ id: startId, f: heuristic(nodeById.get(startId)) }];
+  const open = new MinHeap();
+  open.push({ id: startId, f: heuristic(nodeById.get(startId)) });
 
   let visitedCount = 0;
 
-  while (open.length > 0) {
-    open.sort((a, b) => a.f - b.f);
-    const current = open.shift();
+  while (open.size > 0) {
+    const current = open.pop();
     if (closed.has(current.id)) continue;
     closed.add(current.id);
     visitedCount++;
@@ -353,12 +474,10 @@ export function findRoute(graph, startId, goalId, options = {}) {
     if (current.id === goalId) break;
 
     for (const edge of adjacency.get(current.id)) {
-      // Accessibility filter: this is the ONE line that makes the wheelchair /
-      // pram / luggage route different. Removing edges rather than penalising
-      // them is deliberate — an inaccessible route is not "expensive", it is
-      // unusable.
-      if (accessibleOnly && !edge.accessible) continue;
+      if (!usable(edge)) continue;
 
+      // Directed edges are only ever listed under their `from` node, so this
+      // can never send the search the wrong way up an escalator.
       const neighbourId = edge.from === current.id ? edge.to : edge.from;
       if (closed.has(neighbourId)) continue;
 
@@ -371,34 +490,43 @@ export function findRoute(graph, startId, goalId, options = {}) {
     }
   }
 
-  if (!gScore.has(goalId) || (goalId !== startId && !cameFrom.has(goalId))) return null;
+  if (goalId !== startId && !cameFrom.has(goalId)) return null;
 
-  // Walk the parent pointers back to the start.
+  // Walk the parent pointers back to the start, recording which way each
+  // connector was ridden.
   const nodeIds = [goalId];
   const pathEdges = [];
+  const transports = [];
   let cursor = goalId;
   while (cursor !== startId) {
     const step = cameFrom.get(cursor);
     if (!step) return null;
     pathEdges.push(step.edge);
+    if (step.edge.kind === 'vertical') {
+      transports.push({
+        ...step.edge,
+        fromLevel: nodeById.get(step.from).level,
+        toLevel: nodeById.get(cursor).level,
+      });
+    }
     cursor = step.from;
     nodeIds.push(cursor);
   }
   nodeIds.reverse();
   pathEdges.reverse();
+  transports.reverse();
 
-  const distanceM = pathEdges.reduce((s, e) => s + e.distanceM, 0);
-  const verticalSeconds = pathEdges
-    .filter((e) => e.kind === 'vertical')
-    .reduce((s, e) => s + (e.seconds ?? 0), 0);
+  const distanceM = pathEdges.reduce((sum, e) => sum + e.distanceM, 0);
+  const rideSeconds = transports.reduce((sum, t) => sum + (t.seconds ?? 0), 0);
 
   return {
     nodeIds,
     edges: pathEdges,
     distanceM,
-    // Total time = walking time + time spent riding escalators / waiting for lifts.
-    seconds: distanceM / WALK_SPEED_MPS + verticalSeconds,
-    transports: pathEdges.filter((e) => e.kind === 'vertical'),
+    // Total time = walking time + time spent waiting for and riding connectors.
+    seconds: distanceM / WALK_SPEED_MPS + rideSeconds,
+    transports,
+    profile: profileKey,
     visitedCount,
   };
 }
@@ -406,7 +534,7 @@ export function findRoute(graph, startId, goalId, options = {}) {
 /**
  * Split a route into per-level polylines so each floor can be drawn separately.
  * Returns one entry per contiguous run of nodes on the same level, which is also
- * exactly what the "route continues on Level 2" hand-off marker needs.
+ * exactly what the floor hand-off markers need.
  */
 export function splitRouteByLevel(graph, route) {
   if (!route) return [];
@@ -423,8 +551,66 @@ export function splitRouteByLevel(graph, route) {
   return runs;
 }
 
-/** Human-readable summary of the vertical links a route uses. */
-export function describeTransports(route) {
+/** Human-readable summary of the connectors a route uses, with destination floor. */
+export function describeTransports(route, levelName = (l) => `Level ${l}`) {
   if (!route || route.transports.length === 0) return 'Same level — no stairs or lift needed';
-  return route.transports.map((t) => t.label).join(' → ');
+  return route.transports.map((t) => `${t.label} to ${levelName(t.toLevel)}`).join(', then ');
+}
+
+/**
+ * Turn a route into the step-by-step instructions a user would actually read.
+ *
+ * Consecutive corridor edges collapse into one "walk" step, and each connector
+ * becomes its own step saying which way and to which floor. That grouping IS the
+ * multi-floor UX: a route is a sequence of per-floor legs joined by level
+ * changes.
+ *
+ * @param {object} graph
+ * @param {object} route result of findRoute
+ * @param {(level: number) => string} levelName
+ * @returns {{ kind: 'walk' | 'ride', text: string, level: number, metres?: number, seconds: number }[]}
+ */
+export function routeInstructions(graph, route, levelName = (l) => `Level ${l}`) {
+  if (!route) return [];
+  const steps = [];
+  let walkM = 0;
+  let walkLevel = null;
+
+  const flushWalk = (towards) => {
+    if (walkM < 0.5) {
+      walkM = 0;
+      return;
+    }
+    steps.push({
+      kind: 'walk',
+      level: walkLevel,
+      metres: walkM,
+      seconds: walkM / WALK_SPEED_MPS,
+      text: `Walk ${Math.round(walkM)} m on ${levelName(walkLevel)} ${towards}`,
+    });
+    walkM = 0;
+  };
+
+  let rideIndex = 0;
+  route.edges.forEach((edge, i) => {
+    if (edge.kind !== 'vertical') {
+      walkLevel = graph.nodeById.get(route.nodeIds[i]).level;
+      walkM += edge.distanceM;
+      return;
+    }
+    const ride = route.transports[rideIndex++];
+    flushWalk(`to the ${edge.label.toLowerCase()}`);
+    const way = ride.toLevel > ride.fromLevel ? 'up' : 'down';
+    const what = edge.transport === 'escalator' ? 'escalator' : edge.label.toLowerCase();
+    steps.push({
+      kind: 'ride',
+      level: ride.fromLevel,
+      seconds: edge.seconds,
+      text: `Take the ${what} ${way} to ${levelName(ride.toLevel)}`,
+    });
+  });
+
+  const goal = graph.nodeById.get(route.nodeIds[route.nodeIds.length - 1]);
+  flushWalk(`to ${goal.label ?? 'your destination'}`);
+  return steps;
 }
