@@ -3,6 +3,66 @@
 Branch: `feature/multi-floor`. Nothing here touches `main` until it is tested and
 merged deliberately.
 
+## Status — paused after Phase 2
+
+| Phase | State |
+| --- | --- |
+| 0 — Data model | ✅ done |
+| 1 — Routing | ✅ done |
+| 2 — Floor positioning | ✅ done (engine + tests; **no UI yet** — see Phase 3) |
+| 3 — UX | not started |
+| 4 — Plan alignment | not started |
+
+Also done along the way: a performance pass (calibration 18.8 s → ~0.16 s,
+bit-identical output; full test suite 11.1 s → ~4.4 s with 26 tests).
+
+### Phase 2 results (20 seeds per cell, realistic 30 s Wi-Fi scans)
+
+| Route | Barometer | Median floor-change latency | Changes never detected | Floor correct | Mean error |
+| --- | --- | --- | --- | --- | --- |
+| Entrance (escalator) | off | 12.5 s | 4 / 20 | 79.6% | 2.42 m |
+| Entrance (escalator) | **on** | **3.1 s** | **0 / 20** | **96.2%** | **2.25 m** |
+| Car park (lift, 2 floors) | off | 11.2 s | 0 / 20 | 91.0% | 2.01 m |
+| Car park (lift, 2 floors) | **on** | **3.7 s** | **0 / 20** | **97.2%** | 2.21 m |
+
+Barometer false positives: 0. Transition type (lift / escalator / stairs)
+classified correctly in 79 of 80 rides across both routes and both scan rates. With fast 4 s scans the barometer is at
+parity (1.38 vs 1.37 m entrance; 1.64 vs 1.69 m car park).
+
+### Open findings to pick up on resume
+
+- **Car-park horizontal cost.** On the lift route the barometer costs ~0.2 m of
+  horizontal accuracy (2.00 → 2.22 m, even counting only ticks on the right
+  floor — so it is real, not an artifact of the floors sharing a layout).
+  Untested hypothesis: global Wi-Fi re-localisation (the no-barometer path)
+  resets accumulated along-corridor drift, which the barometer's local
+  transition does not.
+- **Stairs steps are not fed to dead reckoning.** The step counter counts stair
+  steps for the classifier only; a real phone would also (wrongly) move the
+  estimate horizontally. Modelling that is future work.
+- **No route in Tab 3 uses stairs**, so stairs are covered by the unit tests
+  only, not by an end-to-end walk.
+
+### Where Phase 3 resumes
+
+The engine is complete but `FusionTab.jsx` does not expose it yet:
+
+1. Add a **Barometer** layer toggle (`layers.baro`, currently always off in the
+   UI) and include it in the presets.
+2. Add a **route selector** for `WALK_ROUTES` (`entrance`, `carpark`) —
+   `buildWalkPlan(route)` already accepts one.
+3. Show the barometer evidence: relative height (`state.baro.relativeHeightM`),
+   detected changes (`state.floorChanges`), and the latency metric
+   (`state.floorChangeLatencies`); give `'baro'` events their own badge in the
+   correction log.
+4. Tab 1: a **route-profile selector** (`ROUTE_PROFILES`), a connector
+   out-of-service toggle, and step-by-step directions from `routeInstructions()`.
+5. Update README headline numbers and the provenance table (barometer model).
+
+Evaluation harness used for the table above: route × barometer × scan interval,
+20 seeds, measuring latency from true arrival on the new floor to the app
+agreeing. Rebuild it from `test/floorchange.test.js` (end-to-end test) if needed.
+
 ## Goal
 
 Generalise MallNav from a hard-wired two-floor demo to genuine N-floor navigation:

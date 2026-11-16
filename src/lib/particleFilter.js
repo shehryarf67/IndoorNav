@@ -523,6 +523,151 @@ function systematicResample(particles, rng) {
 // Reading an answer out of the cloud
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Floor transitions — map matching in the vertical dimension
+// ---------------------------------------------------------------------------
+
+/**
+ * Move the cloud up or down a number of floors, using only connectors that
+ * could physically have carried each particle there.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * Without it, the filter only discovers a floor change when a Wi-Fi scan
+ * fails to match anything and it gives up and rebuilds the whole cloud from the
+ * radio map. That is slow (the next scan can be 30 s away), and it throws away
+ * everything the filter had learnt about the compass.
+ *
+ * When the barometer reports "you went up one floor", the floor plan tells us
+ * exactly where that was possible: nobody changes floor in the middle of a
+ * corridor. So each particle may only change floor through a connector that
+ *
+ *   - is within reach of where that particle thinks it is,
+ *   - stops on both the floor it is leaving and the floor it is arriving at,
+ *   - runs in that direction (an up-escalator cannot take you down), and
+ *   - is in service.
+ *
+ * A particle with no such connector is an impossible hypothesis and is deleted
+ * — the vertical equivalent of deleting a particle that walked through a wall.
+ * Survivors land AT the connector, so a floor change is also a free position
+ * fix: the user must have been standing there. And unlike re-localisation,
+ * each particle keeps its compass and stride hypotheses.
+ *
+ * @param {Particle[]} particles
+ * @param {{
+ *   deltaFloors: number,          // +1 up one floor, -2 down two, ...
+ *   typeHint?: string,            // 'lift' | 'escalator' | 'stairs' from the classifier
+ *   connectors: object[],         // CONNECTORS from the floor plan
+ *   ordinalByLevel: Map<number, number>,
+ *   levelByOrdinal: Map<number, number>,
+ *   spreadM: number,              // current cloud spread, sets how far "within reach" is
+ * }} event
+ * @param {() => number} rng
+ * @returns {{ particles: Particle[], survived: number, connectorId: string | null, fallback: boolean }}
+ */
+export function applyFloorTransition(particles, event, rng) {
+  const { deltaFloors, typeHint, connectors, ordinalByLevel, levelByOrdinal, spreadM } = event;
+  const goingUp = deltaFloors > 0;
+
+  /** Connectors that could carry someone from `level` by `deltaFloors`. */
+  const candidatesFor = (level) => {
+    const destLevel = levelByOrdinal.get((ordinalByLevel.get(level) ?? level) + deltaFloors);
+    if (destLevel === undefined) return { destLevel, list: [] };
+    const list = connectors.filter(
+      (c) =>
+        c.inService !== false &&
+        c.servesLevels.includes(level) &&
+        c.servesLevels.includes(destLevel) &&
+        (c.direction === 'both' || c.direction === (goingUp ? 'up' : 'down')),
+    );
+    return { destLevel, list };
+  };
+
+  // How far a particle may be from a connector and still plausibly have used
+  // it. Tied to the cloud's own spread: a confident cloud must be close; an
+  // uncertain one is given the benefit of the doubt.
+  const reachM = Math.max(6, 3 * spreadM);
+  const sigma = Math.max(3, spreadM);
+  // The classifier's guess (lift vs escalator vs stairs) is a soft preference,
+  // not a rule — vertical speed and step count are suggestive, not conclusive.
+  const typeWeight = (c) => (!typeHint || c.type === typeHint ? 1 : 0.25);
+
+  const moved = [];
+  const votes = new Map();
+  const cache = new Map();
+
+  for (const p of particles) {
+    if (!cache.has(p.level)) cache.set(p.level, candidatesFor(p.level));
+    const { destLevel, list } = cache.get(p.level);
+    if (!list.length) continue;
+
+    let total = 0;
+    const weights = list.map((c) => {
+      const d = dist(p, c);
+      const w = d > reachM ? 0 : Math.exp(-(d * d) / (2 * sigma * sigma)) * typeWeight(c);
+      total += w;
+      return w;
+    });
+    if (total === 0) continue; // nothing within reach: an impossible hypothesis
+
+    let pick = rng() * total;
+    let chosen = list[list.length - 1];
+    for (let i = 0; i < list.length; i++) {
+      pick -= weights[i];
+      if (pick <= 0) {
+        chosen = list[i];
+        break;
+      }
+    }
+    votes.set(chosen.id, (votes.get(chosen.id) ?? 0) + 1);
+    moved.push({
+      ...p,
+      x: chosen.x + gaussian(rng) * 0.6,
+      y: chosen.y + gaussian(rng) * 0.6,
+      level: destLevel,
+    });
+  }
+
+  if (moved.length > 0) {
+    return {
+      particles: moved,
+      survived: moved.length,
+      connectorId: [...votes.entries()].sort((a, b) => b[1] - a[1])[0][0],
+      fallback: false,
+    };
+  }
+
+  // No particle was near any admissible connector. The barometer is far more
+  // trustworthy about "you changed floor" than the cloud is about "you were
+  // here", so rather than ignore the floor change, spread the cloud across every
+  // connector that could have made it, keeping the sensor hypotheses.
+  const summary = summariseParticles(particles);
+  const { destLevel, list } = candidatesFor(summary?.level ?? particles[0]?.level);
+  if (!list.length) return { particles, survived: 0, connectorId: null, fallback: true };
+
+  // Weighted by distance from the cloud, so the nearest plausible connector
+  // dominates; a uniform choice put most of the cloud at connectors 20 m away.
+  const centre = summary ?? particles[0];
+  const fbWeights = list.map((c) => {
+    const d = dist(centre, c);
+    return Math.exp(-(d * d) / (2 * 10 * 10)) * typeWeight(c);
+  });
+  const fbTotal = fbWeights.reduce((a, b) => a + b, 0) || 1;
+  const fallbackParticles = particles.map((p) => {
+    let pick = rng() * fbTotal;
+    let c = list[list.length - 1];
+    for (let i = 0; i < list.length; i++) {
+      pick -= fbWeights[i];
+      if (pick <= 0) {
+        c = list[i];
+        break;
+      }
+    }
+    return { ...p, x: c.x + gaussian(rng) * 0.6, y: c.y + gaussian(rng) * 0.6, level: destLevel };
+  });
+  return { particles: fallbackParticles, survived: 0, connectorId: null, fallback: true };
+}
+
 /** Cell size for finding the densest cluster in the cloud, in metres. */
 const MODE_CELL_M = 2;
 
