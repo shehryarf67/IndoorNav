@@ -4,7 +4,9 @@
  * This is a JavaScript port of the Python simulation: radio-map generation, a
  * log-distance-plus-wall-loss propagation model, weighted k-nearest-neighbour
  * fingerprinting, least-squares trilateration, and the model-mismatch
- * experiment. Everything runs client-side in a few milliseconds.
+ * experiment. Everything runs client-side; building the radio map and running a
+ * full batch evaluation each finish in well under a second (Tab 2 shows the
+ * measured times).
  *
  * THE PROPAGATION MODEL
  * ---------------------
@@ -15,10 +17,12 @@
  *   n         path-loss exponent — how fast signal decays with distance
  *   d         straight-line distance from point to AP (metres)
  *   walls_crossed  number of wall segments the straight line punches through
+ *   floors_crossed number of floor slabs between the receiver and the AP
  *   noise     zero-mean Gaussian, representing multipath and receiver noise
  *
  * The `walls_crossed` term is the whole story of this tab. It is why two points
- * the same distance from an access point can differ by 30 dB, and therefore why
+ * the same distance from an access point can differ by over 25 dB in this
+ * building (four walls' worth; Tab 2 measures it live on the heatmap), and why
  * the intuitive geometric method (trilateration) collapses indoors while
  * pattern-matching (fingerprinting) does not.
  *
@@ -214,11 +218,11 @@ export function observeVector(point, level, aps, wallsByLevel, model, rng) {
  * THIS IS THE SECOND AUTOMATION CONTRIBUTION. Conventionally this database is
  * produced by a "site survey": a person walks to every grid point with a laptop
  * and records the Wi-Fi for ~1.5 minutes. For this mall that is several hundred
- * points, i.e. days of labour, and it must be repeated whenever the AP layout
+ * points per level, i.e. days of labour, and it must be repeated whenever the AP layout
  * changes. Here it is PREDICTED from the floor plan in milliseconds.
  *
  * @param {object[]} levels level objects from floorplan.js
- * @param {object[]} aps every AP in the building (both levels)
+ * @param {object[]} aps every AP in the building (all levels)
  * @param {number} spacing grid spacing in metres
  * @param {typeof MAP_MODEL} model the assumed propagation model
  */
@@ -271,8 +275,8 @@ export function buildRadioMap(levels, aps, spacing = DEFAULT_SPACING_M, model = 
 /**
  * Estimate position by pattern matching.
  *
- * We treat each location's signal vector as a point in 14-dimensional "signal
- * space" (one dimension per access point). To locate a phone, we find the k
+ * We treat each location's signal vector as a point in "signal space", with one
+ * dimension per access point in the building (every level, not just the user's). To locate a phone, we find the k
  * reference points whose stored signal vectors are closest to what the phone
  * just heard, then average their real-world coordinates, weighting each by
  * 1/(signal distance) so a closer match counts for more.
@@ -354,8 +358,9 @@ export function knnFingerprint(obs, radioMap, k = KNN_K) {
  * implementation — it is the fundamental problem with the method. To subtract
  * wall loss you would need to already know where you are, which is the thing you
  * are trying to find out. So every wall between the phone and the AP is silently
- * misread as extra distance. Six walls at 6.5 dB is 39 dB of loss, which this
- * formula reports as being roughly 12x further away than the phone really is.
+ * misread as extra distance. Six walls at 6.5 dB is 39 dB of loss, which with
+ * n = 2.8 this formula reports as roughly 25x further away than the phone really
+ * is (10^(39 / 28) ≈ 24.7).
  */
 export function rssiToDistance(rssi, model) {
   return 10 ** ((model.p0 - rssi) / (10 * model.n));

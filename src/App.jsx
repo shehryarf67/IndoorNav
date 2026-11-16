@@ -3,6 +3,9 @@ import MapBuilderTab from './tabs/MapBuilderTab.jsx';
 import WifiPositioningTab from './tabs/WifiPositioningTab.jsx';
 import FusionTab from './tabs/FusionTab.jsx';
 import { Badge } from './components/ui.jsx';
+// The header names the floors from the data, so it cannot go stale again the
+// way "two-level mall" did when the car park was added.
+import { LEVELS } from './floorplan/floorplan.js';
 
 /**
  * App — the shell holding the three prototypes.
@@ -61,7 +64,7 @@ export default function App() {
             </h1>
             <p className="mt-0.5 text-xs text-ink-faint">
               Prototype suite — three demonstrations running entirely in the browser on a
-              simulated two-level mall
+              simulated {LEVELS.length}-level mall ({LEVELS.map((l) => l.name).join(' · ')})
             </p>
           </div>
           <div className="flex flex-wrap items-center justify-end gap-2">

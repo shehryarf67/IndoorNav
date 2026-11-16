@@ -2,7 +2,8 @@
  * Short-walk AP calibration for Tab 2.
  *
  * Instead of surveying every radio-map point, a technician records all APs at
- * twenty known corridor stops. A coarse-to-fine nonlinear search estimates AP
+ * STOPS_PER_LEVEL (10) known corridor stops per level — 30 in this three-level
+ * mall. A coarse-to-fine nonlinear search estimates AP
  * floor/position; then a small least-squares fit estimates the global path-loss
  * exponent and wall attenuation from the same measurements.
  */
@@ -93,6 +94,9 @@ export function runApCalibration(levels, trueAps, realityModel = MAP_MODEL, seed
     floorAccuracy: estimates.filter((item) => item.floorCorrect).length / estimates.length,
     measurementCount: stops.length * trueAps.length,
     averagedScans: AVERAGED_SCANS,
+    // 0.4 min per stop is an ASSUMED walking-plus-scanning time (a short walk
+    // between spread-out stops plus AVERAGED_SCANS scans), chosen, not measured.
+    // It only sizes the effort comparison shown on screen; nothing depends on it.
     estimatedWalkMinutes: stops.length * 0.4,
     buildMs: performance.now() - t0,
     bestCase: true,

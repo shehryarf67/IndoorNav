@@ -55,11 +55,28 @@ export const PF_CONFIG = {
   headingHypothesisSigma: 0.15,
 
   /**
-   * Process noise on the compass hypothesis per step. Lets the filter track a
-   * bias that changes as the user walks past different steel structures. Too
-   * small and the filter cannot follow; too large and it forgets what it learnt.
+   * Process noise on the compass hypothesis, radians per √step. Lets the filter
+   * track a bias that changes as the user walks past different steel
+   * structures. Too small and the filter cannot follow; too large and it
+   * forgets what it learnt.
+   *
+   * CHOSEN BY A CONSISTENCY TEST, not by minimising error. A filter is
+   * "consistent" when the spread it claims matches the error it actually has:
+   * the true heading error divided by the cloud's heading spread should have an
+   * RMS of about 1 (the normalised-error test standard in navigation filters;
+   * the truth is used only offline, to grade the setting). Results over 20
+   * walks on each route, RMS of that ratio (above 1 = overconfident):
+   *
+   *   0.012 -> 2.1 / 2.9   0.02 -> 1.6 / 1.9   0.035 -> 1.1 / 0.9   0.06 -> 0.7
+   *
+   * The earlier 0.012 claimed a heading 2–3x more certain than it was. That
+   * overconfidence was invisible while Wi-Fi re-localisation kept rebuilding the
+   * cloud, but once the barometer handed the filter an exact position at the
+   * lift, the over-sure heading carried the cloud into the corridor wall and no
+   * particle was left near the truth for Wi-Fi to re-weight. 0.035 is the
+   * smallest value the test calls consistent on both routes.
    */
-  headingHypothesisDrift: 0.012,
+  headingHypothesisDrift: 0.035,
 
   /** Spread of each particle's stride-scale hypothesis (fraction). */
   strideHypothesisSigma: 0.07,
@@ -208,6 +225,25 @@ export function propagate(particles, measuredHeading, measuredMetres, rng) {
   }
 
   return { particles: out, moved };
+}
+
+/**
+ * Steps that are NOT horizontal travel (stair steps, held back by the
+ * barometer gate) still count for the compass model: its bias random-walks
+ * per step taken, and a step up a steel stair core is a step. So each
+ * particle's compass hypothesis keeps diffusing exactly as in `propagate`,
+ * with no movement. Without this the cloud came off a two-floor stair climb
+ * as sure of the compass as it was at the top, while the real bias had moved
+ * by ~0.3 rad, and the over-sure heading walked it away from the truth.
+ *
+ * @param {Particle[]} particles
+ * @param {number} steps step-counter steps taken this tick
+ * @param {() => number} rng
+ * @returns {Particle[]}
+ */
+export function diffuseHeading(particles, steps, rng) {
+  const sigma = PF_CONFIG.headingHypothesisDrift * Math.sqrt(Math.max(1e-6, steps));
+  return particles.map((p) => ({ ...p, ho: p.ho + gaussian(rng) * sigma }));
 }
 
 // ---------------------------------------------------------------------------
@@ -561,26 +597,63 @@ function systematicResample(particles, rng) {
  *   ordinalByLevel: Map<number, number>,
  *   levelByOrdinal: Map<number, number>,
  *   spreadM: number,              // current cloud spread, sets how far "within reach" is
+ *   fromLevel?: number,           // floor the app was on when the climb began; only used for
+ *                                 // particles whose own floor cannot make the trip (see below)
  * }} event
  * @param {() => number} rng
- * @returns {{ particles: Particle[], survived: number, connectorId: string | null, fallback: boolean }}
+ * @returns {{
+ *   particles: Particle[],
+ *   survived: number,              // particles that were near an admissible connector
+ *   connectorId: string | null,    // the connector most survivors used (null on fallback)
+ *   fallback: boolean,             // true when no particle was near an admissible connector
+ *   applied: boolean,              // false when NO floor in the cloud could make this trip, so the
+ *                                  // particles are returned unchanged and the floor change was not applied
+ * }}
  */
 export function applyFloorTransition(particles, event, rng) {
-  const { deltaFloors, typeHint, connectors, ordinalByLevel, levelByOrdinal, spreadM } = event;
+  const { deltaFloors, typeHint, connectors, ordinalByLevel, levelByOrdinal, spreadM, fromLevel } =
+    event;
   const goingUp = deltaFloors > 0;
 
-  /** Connectors that could carry someone from `level` by `deltaFloors`. */
-  const candidatesFor = (level) => {
-    const destLevel = levelByOrdinal.get((ordinalByLevel.get(level) ?? level) + deltaFloors);
+  /** Connectors that could carry someone from floor `origin` by `deltaFloors`. */
+  const tripFrom = (origin) => {
+    const destLevel = levelByOrdinal.get((ordinalByLevel.get(origin) ?? origin) + deltaFloors);
     if (destLevel === undefined) return { destLevel, list: [] };
     const list = connectors.filter(
       (c) =>
         c.inService !== false &&
-        c.servesLevels.includes(level) &&
+        c.servesLevels.includes(origin) &&
         c.servesLevels.includes(destLevel) &&
         (c.direction === 'both' || c.direction === (goingUp ? 'up' : 'down')),
     );
     return { destLevel, list };
+  };
+
+  /**
+   * The trip a particle on `level` is held to.
+   *
+   * Each particle is judged from its OWN floor first. That is what lets the
+   * barometer settle the floor: "up two floors" is only possible from P, so if
+   * the app's best guess was L1 when the climb began, the particles that were
+   * (rightly) on P still make the trip and the wrong-floor ones are deleted.
+   * Judging every particle from the app's guess instead would make the trip
+   * impossible for the whole cloud and the floor change would be dropped.
+   *
+   * `fromLevel` — the floor the app believed it was on when the climb began —
+   * is only a second chance for particles whose own floor CANNOT make the
+   * trip. Those are typically particles a Wi-Fi scan landing between arrival
+   * and confirmation has already re-localised onto the new floor: from their
+   * own level they would be asked to climb two MORE floors, find no connector,
+   * and the barometer's evidence ("you were at the lift when you arrived")
+   * would be thrown away. Judged from `fromLevel` they are held to the same
+   * rule as everyone else: be near a connector that could have made this
+   * trip. A connector stands at the same (x, y) on every floor it serves, so a
+   * particle's current level does not change the distance test.
+   */
+  const candidatesFor = (level) => {
+    const own = tripFrom(level);
+    if (own.list.length || fromLevel === undefined || fromLevel === level) return own;
+    return tripFrom(fromLevel);
   };
 
   // How far a particle may be from a connector and still plausibly have used
@@ -634,6 +707,7 @@ export function applyFloorTransition(particles, event, rng) {
       survived: moved.length,
       connectorId: [...votes.entries()].sort((a, b) => b[1] - a[1])[0][0],
       fallback: false,
+      applied: true,
     };
   }
 
@@ -641,9 +715,34 @@ export function applyFloorTransition(particles, event, rng) {
   // trustworthy about "you changed floor" than the cloud is about "you were
   // here", so rather than ignore the floor change, spread the cloud across every
   // connector that could have made it, keeping the sensor hypotheses.
+  //
+  // The cloud's densest floor is tried first. If no connector could make this
+  // trip from there (e.g. "up two floors" while the mode is on L1), every other
+  // floor the cloud holds is tried, most-populated first: the barometer has
+  // just said which floors are possible, and ignoring it would be worse.
   const summary = summariseParticles(particles);
-  const { destLevel, list } = candidatesFor(summary?.level ?? particles[0]?.level);
-  if (!list.length) return { particles, survived: 0, connectorId: null, fallback: true };
+  const countByLevel = new Map();
+  for (const p of particles) countByLevel.set(p.level, (countByLevel.get(p.level) ?? 0) + 1);
+  const firstLevel = summary?.level ?? particles[0]?.level;
+  const levelsToTry = [
+    firstLevel,
+    ...[...countByLevel.entries()]
+      .filter(([lvl]) => lvl !== firstLevel)
+      .sort((a, b) => b[1] - a[1])
+      .map(([lvl]) => lvl),
+  ];
+  let destLevel;
+  let list = [];
+  for (const lvl of levelsToTry) {
+    ({ destLevel, list } = candidatesFor(lvl));
+    if (list.length) break;
+  }
+  // Truly impossible from every floor in the cloud (and from `fromLevel`):
+  // nothing honest can be done with this reading, so leave the cloud alone and
+  // say so — the caller must not report the floor change as applied.
+  if (!list.length) {
+    return { particles, survived: 0, connectorId: null, fallback: true, applied: false };
+  }
 
   // Weighted by distance from the cloud, so the nearest plausible connector
   // dominates; a uniform choice put most of the cloud at connectors 20 m away.
@@ -665,7 +764,13 @@ export function applyFloorTransition(particles, event, rng) {
     }
     return { ...p, x: c.x + gaussian(rng) * 0.6, y: c.y + gaussian(rng) * 0.6, level: destLevel };
   });
-  return { particles: fallbackParticles, survived: 0, connectorId: null, fallback: true };
+  return {
+    particles: fallbackParticles,
+    survived: 0,
+    connectorId: null,
+    fallback: true,
+    applied: true,
+  };
 }
 
 /** Cell size for finding the densest cluster in the cloud, in metres. */

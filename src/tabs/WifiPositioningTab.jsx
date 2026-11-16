@@ -22,10 +22,11 @@ import {
   buildingBounds,
   makeRng,
   rssiToDistance,
+  summarise,
 } from '../lib/wifi.js';
-import { runApCalibration } from '../lib/apCalibration.js';
+import { runApCalibration, CALIBRATION_CONFIG } from '../lib/apCalibration.js';
 import { RSSI_BANDS, ERROR_BANDS, rssiColor, errorColor } from '../lib/signalColor.js';
-import FloorPlanSvg from '../components/FloorPlanSvg.jsx';
+import FloorPlanSvg, { CONNECTOR_LEGEND } from '../components/FloorPlanSvg.jsx';
 import ExplainerPanel from '../components/ExplainerPanel.jsx';
 import { Panel, Button, Stat, Select, Slider, Badge, EvidenceStrip } from '../components/ui.jsx';
 
@@ -35,6 +36,64 @@ import { Panel, Button, Stat, Select, Slider, Badge, EvidenceStrip } from '../co
  * floor slab, which is a confusing first picture.
  */
 const DEFAULT_AP = ALL_APS.find((ap) => ap.level === GROUND_LEVEL) ?? ALL_APS[0];
+
+/**
+ * Display names, looked up from the floor plan rather than printed as
+ * "Level {n}": the car park's identifier is 0 but it is signed "P", and copy
+ * built from the raw number would call it "Level 0".
+ */
+const levelName = (n) => LEVELS.find((l) => l.level === n)?.name ?? `Level ${n}`;
+const levelShort = (n) => LEVELS.find((l) => l.level === n)?.shortName ?? `L${n}`;
+
+/**
+ * Size of the calibration walk, derived from the calibration module so the copy
+ * cannot drift from what the code actually does when floors or stops change.
+ */
+const CALIBRATION_STOP_COUNT = CALIBRATION_CONFIG.stopsPerLevel * LEVELS.length;
+
+/**
+ * How much of the calibration walk actually heard anything. Counted from the
+ * averaged readings rather than asserted in copy, because coverage depends on
+ * the floor plan: a car-park stop is two slabs from the Level 2 APs and many of
+ * its readings sit at the sensitivity floor. "Heard" uses the same threshold as
+ * the live-reading readout (strictly above MAP_MODEL.floorDbm).
+ *
+ * @param {ArrayLike<number>[]} observations one averaged vector per stop
+ * @returns {{heard: number, total: number, minPerStop: number, maxPerStop: number}}
+ */
+function summariseHeardReadings(observations) {
+  let heard = 0;
+  let total = 0;
+  let minPerStop = Infinity;
+  let maxPerStop = 0;
+  for (const vector of observations) {
+    let heardHere = 0;
+    for (let i = 0; i < vector.length; i++) {
+      if (vector[i] > MAP_MODEL.floorDbm) heardHere++;
+    }
+    heard += heardHere;
+    total += vector.length;
+    minPerStop = Math.min(minPerStop, heardHere);
+    maxPerStop = Math.max(maxPerStop, heardHere);
+  }
+  return { heard, total, minPerStop: observations.length ? minPerStop : 0, maxPerStop };
+}
+
+/**
+ * Per-level AP counts and ID ranges for the legend, e.g. "4 on P (AP15–AP18)".
+ * IDs are not numbered bottom-up (the car park was added after L1 and L2), so
+ * the range is read from the data instead of assumed.
+ */
+const AP_SUMMARY = LEVELS.map(
+  (l) => `${l.aps.length} on ${l.shortName} (${l.aps[0].id}–${l.aps[l.aps.length - 1].id})`,
+).join(', ');
+
+/**
+ * Distance bin used when measuring how much signal differs between points the
+ * same distance from an AP. 0.5 m is chosen: wide enough to collect several
+ * heatmap cells per bin, narrow enough that distance alone explains < 1 dB.
+ */
+const SAME_DISTANCE_BIN_M = 0.5;
 
 /**
  * TAB 2 — Wi-Fi Positioning
@@ -60,7 +119,11 @@ const VIEWS = [
   { id: 'coverage', label: 'Coverage heatmap', hint: 'why trilateration fails' },
   { id: 'live', label: 'Live positioning', hint: 'click to place yourself' },
   { id: 'errors', label: 'Error map', hint: 'where accuracy is weak' },
-  { id: 'calibration', label: 'AP calibration', hint: 'locate unknown routers from 20 stops' },
+  {
+    id: 'calibration',
+    label: 'AP calibration',
+    hint: `locate unknown routers from ${CALIBRATION_STOP_COUNT} stops`,
+  },
 ];
 
 const REALITY_PRESETS = [
@@ -92,7 +155,7 @@ const REALITY_PRESETS = [
 
 export default function WifiPositioningTab({ presentationMode = false }) {
   const [radioMap, setRadioMap] = useState(null);
-  const [levelNo, setLevelNo] = useState(1);
+  const [levelNo, setLevelNo] = useState(GROUND_LEVEL);
   const [view, setView] = useState('coverage');
   const [selectedApId, setSelectedApId] = useState(DEFAULT_AP.id);
   const [truePoint, setTruePoint] = useState(null);
@@ -100,6 +163,10 @@ export default function WifiPositioningTab({ presentationMode = false }) {
   const [batchMs, setBatchMs] = useState(null);
   const [calibration, setCalibration] = useState(null);
   const [calibrating, setCalibrating] = useState(false);
+  const heardSummary = useMemo(
+    () => (calibration ? summariseHeardReadings(calibration.observations) : null),
+    [calibration],
+  );
 
   /**
    * The "real world" propagation parameters. The radio map is always built with
@@ -146,14 +213,34 @@ export default function WifiPositioningTab({ presentationMode = false }) {
 
     const cells = [];
     const step = HEATMAP_CELL_M;
+    // Min/max RSSI per distance bin, so the "same distance, different signal"
+    // claim in the caption is measured on the map being shown, not quoted.
+    const byDistance = new Map();
+    let heard = 0;
     for (let x = 1; x < BUILDING.widthM - 1; x += step) {
       for (let y = 1; y < BUILDING.heightM - 1; y += step) {
         const p = { x: x + step / 2, y: y + step / 2 };
         const rssi = predictRssi(p, levelNo, ap, radioMap.wallsByLevel, MAP_MODEL);
         cells.push({ x, y, rssi });
+        // Cells at the sensitivity floor are excluded: "not heard" is clipped,
+        // so its difference from a heard cell is not a real dB figure.
+        if (rssi <= MAP_MODEL.floorDbm) continue;
+        heard++;
+        const bin = Math.round(dist(p, ap) / SAME_DISTANCE_BIN_M);
+        const range = byDistance.get(bin);
+        if (range) {
+          range.lo = Math.min(range.lo, rssi);
+          range.hi = Math.max(range.hi, rssi);
+        } else {
+          byDistance.set(bin, { lo: rssi, hi: rssi });
+        }
       }
     }
-    return { ap, cells, step };
+    let sameDistanceSpreadDb = 0;
+    for (const { lo, hi } of byDistance.values()) {
+      sameDistanceSpreadDb = Math.max(sameDistanceSpreadDb, hi - lo);
+    }
+    return { ap, cells, step, sameDistanceSpreadDb, heardFraction: heard / cells.length };
   }, [radioMap, selectedApId, levelNo]);
 
   // ---- 3. Live positioning ------------------------------------------------
@@ -231,10 +318,18 @@ export default function WifiPositioningTab({ presentationMode = false }) {
   }, [radioMap]);
 
   const selectedAp = ALL_APS.find((a) => a.id === selectedApId);
+  // The worked example must use an AP on the level being viewed: an AP on
+  // another floor adds slab loss, and the text would then blame walls for loss
+  // that was really the floor. Falls back to this level's first AP.
+  const exampleAp =
+    selectedAp && selectedAp.level === levelNo ? selectedAp : (level.aps[0] ?? DEFAULT_AP);
   const wallExample = useMemo(
-    () => findWallFailureExample(level, selectedAp ?? DEFAULT_AP, radioMap?.wallsByLevel),
-    [level, selectedAp, radioMap],
+    () => findWallFailureExample(level, exampleAp, radioMap?.wallsByLevel),
+    [level, exampleAp, radioMap],
   );
+  // Same slab count predictRssi charges (it differences level identifiers), so
+  // the dB figure quoted in the caption is the one actually in the heatmap.
+  const slabsToSelectedAp = selectedAp ? Math.abs(selectedAp.level - levelNo) : 0;
 
   return (
     <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_380px]">
@@ -313,6 +408,8 @@ export default function WifiPositioningTab({ presentationMode = false }) {
                 key={l.level}
                 type="button"
                 onClick={() => setLevelNo(l.level)}
+                aria-pressed={l.level === levelNo}
+                title={`Show ${l.name}`}
                 className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
                   l.level === levelNo ? 'bg-brand text-white' : 'text-ink-soft hover:text-ink'
                 }`}
@@ -326,18 +423,38 @@ export default function WifiPositioningTab({ presentationMode = false }) {
         {/* ---- Contextual instruction for the active view ---- */}
         {radioMap && (
           <div className="rounded-lg border border-line bg-surface px-3 py-2 text-xs text-ink-soft">
-            {view === 'coverage' && (
+            {view === 'coverage' && heatmap && (
               <>
-                Showing predicted signal from <strong className="text-ink">{selectedApId}</strong>
-                {selectedAp.level !== levelNo && (
+                Showing predicted signal from <strong className="text-ink">{selectedApId}</strong>{' '}
+                on <strong className="text-ink">{level.name}</strong>
+                {slabsToSelectedAp > 0 && (
                   <>
                     {' '}
-                    (which is on <strong className="text-ink">Level {selectedAp.level}</strong> —
-                    you are seeing it bleed through the floor slab)
+                    (the AP is on <strong className="text-ink">{levelName(selectedAp.level)}</strong> —
+                    you are seeing it bleed through {slabsToSelectedAp} floor{' '}
+                    {slabsToSelectedAp === 1 ? 'slab' : 'slabs'}, −
+                    {slabsToSelectedAp * MAP_MODEL.floorLossDb} dB)
                   </>
                 )}
-                . Notice the sharp steps at every storefront: two points the same distance from
-                the AP can differ by 30 dB. That is what breaks trilateration.
+                ; it is heard on{' '}
+                <strong className="tnum text-ink">
+                  {(heatmap.heardFraction * 100).toFixed(0)}%
+                </strong>{' '}
+                of this level&rsquo;s floor area (above the {MAP_MODEL.floorDbm} dBm receiver
+                sensitivity floor).
+                {heatmap.sameDistanceSpreadDb > 0 ? (
+                  <>
+                    {' '}
+                    Notice the sharp steps at every storefront: on this map, two points the same
+                    distance from the AP (to within {SAME_DISTANCE_BIN_M} m) differ by up to{' '}
+                    <strong className="tnum text-ink">
+                      {heatmap.sameDistanceSpreadDb.toFixed(0)} dB
+                    </strong>
+                    . That is what breaks trilateration.
+                  </>
+                ) : (
+                  ' Pick an AP on this level to see the wall steps that break trilateration.'
+                )}
               </>
             )}
             {view === 'live' && (
@@ -356,8 +473,10 @@ export default function WifiPositioningTab({ presentationMode = false }) {
             )}
             {view === 'calibration' && (
               <>
-                Twenty known stops replace a full fingerprint survey. Black rings are the real APs
-                (shown only for grading); blue markers are recovered positions. Lines are estimation error.
+                {CALIBRATION_STOP_COUNT} known stops ({CALIBRATION_CONFIG.stopsPerLevel} on each of
+                the {LEVELS.length} levels) replace a full fingerprint survey. Black rings are the
+                real APs (shown only for grading); blue markers are recovered positions. Lines are
+                estimation error.
               </>
             )}
           </div>
@@ -576,7 +695,7 @@ export default function WifiPositioningTab({ presentationMode = false }) {
             title={`Batch comparison — ${BATCH_TRIALS} random positions`}
             subtitle={
               batch
-                ? `Completed in ${batchMs.toFixed(0)} ms across both levels${mismatched ? ' · using your modified reality settings' : ''}`
+                ? `Completed in ${batchMs.toFixed(0)} ms across all ${LEVELS.length} levels${mismatched ? ' · using your modified reality settings' : ''}`
                 : 'Evaluate both methods across the whole building'
             }
             actions={<Button onClick={runBatch}>Run {BATCH_TRIALS} random tests</Button>}
@@ -585,7 +704,8 @@ export default function WifiPositioningTab({ presentationMode = false }) {
               <ResultsTable batch={batch} />
             ) : (
               <p className="text-xs text-ink-soft">
-                Places {BATCH_TRIALS} random points across the walkable area of both levels,
+                Places {BATCH_TRIALS} random points across the walkable area of all{' '}
+                {LEVELS.length} levels,
                 simulates a Wi-Fi reading at each, and locates it with both methods. Results are
                 reproducible — the random sequence is seeded.
               </p>
@@ -611,7 +731,7 @@ export default function WifiPositioningTab({ presentationMode = false }) {
               kind: 'dot',
               color: '#7c3aed',
               label: 'Wi-Fi access point',
-              desc: '7 per level, ceiling-mounted along the corridors — labelled AP1…AP14',
+              desc: `ceiling-mounted along the corridors — ${ALL_APS.length} in total: ${AP_SUMMARY}`,
             },
             {
               kind: 'gradient',
@@ -679,8 +799,11 @@ export default function WifiPositioningTab({ presentationMode = false }) {
               kind: 'dot',
               color: '#f59e0b',
               label: 'Calibration stop',
-              desc: 'numbered measured positions selected across both floors; several RSSI scans are averaged at each stop',
+              desc: `numbered measured positions, ${CALIBRATION_CONFIG.stopsPerLevel} per level on all ${LEVELS.length} levels; ${CALIBRATION_CONFIG.averagedScans} RSSI scans are averaged at each stop`,
             },
+            // Escalator / stairs / lift markers appear on every view except the
+            // coverage heatmap, so they need the same legend as the other tabs.
+            ...CONNECTOR_LEGEND,
           ]}
           whyItMatters="Positioning is the product: the experiment tests whether modelling a small set of venue parameters can reduce—not magically eliminate—the site calibration needed for a usable blue dot."
           footnote={`Propagation model: RSSI = P0 − 10·n·log₁₀(d) − walls×wall_loss − floors×floor_loss + noise, with P0 = ${MAP_MODEL.p0} dBm, n = ${MAP_MODEL.n}, wall_loss = ${MAP_MODEL.wallLossDb} dB, floor_loss = ${MAP_MODEL.floorLossDb} dB, noise σ = ${MAP_MODEL.noiseSigmaDb} dB, signal floor ${MAP_MODEL.floorDbm} dBm. "walls" is the number of wall segments the straight line from the point to the AP intersects. Ported from the tested Python simulation.`}
@@ -701,10 +824,10 @@ export default function WifiPositioningTab({ presentationMode = false }) {
               ))}
             </Select>
             <p className="mt-2 text-[11px] leading-snug text-ink-soft">
-              Try selecting an AP on the other level: the signal still reaches, about{' '}
-              {MAP_MODEL.floorLossDb} dB weaker through the floor slab. That difference is what
-              lets fingerprinting tell the floors apart — and trilateration cannot, because it
-              solves in 2D only.
+              Try selecting an AP on another level: the signal still reaches, about{' '}
+              {MAP_MODEL.floorLossDb} dB weaker for every floor slab it crosses. That difference
+              is what lets fingerprinting tell the floors apart — and trilateration cannot,
+              because it solves in 2D only.
             </p>
           </Panel>
         )}
@@ -752,9 +875,12 @@ export default function WifiPositioningTab({ presentationMode = false }) {
 
                 {wallExample && (
                   <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[11px] leading-relaxed text-red-950">
-                    <strong>Why the circles lie:</strong> this worked example is {wallExample.realDistanceM.toFixed(1)} m from{' '}
-                    {wallExample.ap.id} through {wallExample.walls} walls. Its predicted {wallExample.rssiDbm.toFixed(1)} dBm signal is
-                    inverted as {wallExample.inferredDistanceM.toFixed(0)} m — the wall loss is mistaken for distance.
+                    <strong>Why the circles lie:</strong> a corridor point{' '}
+                    {wallExample.realDistanceM.toFixed(1)} m from {wallExample.ap.id} (an AP on this
+                    level) sits behind {wallExample.walls} walls. Its predicted{' '}
+                    {wallExample.rssiDbm.toFixed(1)} dBm signal is inverted as{' '}
+                    {wallExample.inferredDistanceM.toFixed(0)} m — the wall loss is mistaken for
+                    distance.
                   </div>
                 )}
 
@@ -764,7 +890,9 @@ export default function WifiPositioningTab({ presentationMode = false }) {
                   </div>
                   <div className="mt-0.5 text-xs text-ink">
                     Fingerprinting says{' '}
-                    <strong>Level {livePosition.fp?.level ?? '?'}</strong>{' '}
+                    <strong>
+                      {livePosition.fp ? levelName(livePosition.fp.level) : 'no answer'}
+                    </strong>{' '}
                     {livePosition.fpLevelCorrect ? (
                       <Badge tone="good">correct</Badge>
                     ) : (
@@ -787,7 +915,7 @@ export default function WifiPositioningTab({ presentationMode = false }) {
                         <div key={ap.id} className="flex items-baseline justify-between gap-2">
                           <span className="text-ink-soft">
                             {ap.id}
-                            <span className="text-ink-faint"> L{ap.level}</span>
+                            <span className="text-ink-faint"> {levelShort(ap.level)}</span>
                           </span>
                           <span
                             className={`tnum font-medium ${heard ? 'text-ink' : 'text-ink-faint'}`}
@@ -810,14 +938,25 @@ export default function WifiPositioningTab({ presentationMode = false }) {
             subtitle="Measure the model, not the whole map"
             actions={
               <Button onClick={runCalibration} disabled={calibrating}>
-                {calibrating ? 'Estimating APs…' : calibration ? 'Run again' : 'Run 20-stop calibration'}
+                {calibrating
+                  ? 'Estimating APs…'
+                  : calibration
+                    ? 'Run again'
+                    : `Run ${CALIBRATION_STOP_COUNT}-stop calibration`}
               </Button>
             }
           >
             {!calibration ? (
               <div className="space-y-3 text-xs leading-relaxed text-ink-soft">
                 <p>
-                  The simulated technician stops at ten known points per floor and hears every AP.
+                  The simulated technician stops at {CALIBRATION_CONFIG.stopsPerLevel} known points
+                  on each of the {LEVELS.length} levels ({CALIBRATION_STOP_COUNT} stops), averages{' '}
+                  {CALIBRATION_CONFIG.averagedScans} scans at each, and records a reading for each
+                  of the {ALL_APS.length} APs. A reading below the {MAP_MODEL.floorDbm} dBm
+                  receiver sensitivity floor is recorded as <em>not heard</em> — common for APs
+                  one or two floors away, so no stop hears every AP. A not-heard reading is still
+                  evidence (the AP search prefers positions that predict silence there), but only
+                  heard readings feed the <strong className="text-ink">n</strong> and wall-loss fit.
                   A coarse-to-fine nonlinear search estimates each AP, then least squares fits
                   <strong className="text-ink"> n</strong> and <strong className="text-ink">wall loss</strong>.
                 </p>
@@ -835,8 +974,13 @@ export default function WifiPositioningTab({ presentationMode = false }) {
                   <Stat label="Fitted wall loss" value={calibration.fittedModel.wallLossDb.toFixed(2)} unit="dB" hint={`truth ${MAP_MODEL.wallLossDb} dB`} />
                 </div>
                 <div className="rounded-lg border border-line bg-canvas px-3 py-2 text-xs leading-relaxed text-ink-soft">
-                  <strong className="text-ink">{calibration.measurementCount} measurements</strong> ({calibration.stops.length} stops × {ALL_APS.length} APs),
+                  <strong className="text-ink">{calibration.measurementCount} readings</strong> ({calibration.stops.length} stops × {ALL_APS.length} APs),
                   about {calibration.estimatedWalkMinutes.toFixed(0)} minutes of walking, replace roughly {radioMap.points.length * ALL_APS.length} individually surveyed signal values.
+                  Of those readings, <strong className="text-ink">{heardSummary.heard}</strong> (
+                  {((heardSummary.heard / Math.max(1, heardSummary.total)) * 100).toFixed(0)}%) were
+                  heard above {MAP_MODEL.floorDbm} dBm; the rest are recorded as not heard. Each
+                  stop heard between {heardSummary.minPerStop} and {heardSummary.maxPerStop} of
+                  the {ALL_APS.length} APs.
                 </div>
                 <div className="grid grid-cols-2 gap-2">
                   <Stat
@@ -850,7 +994,7 @@ export default function WifiPositioningTab({ presentationMode = false }) {
                     value={calibration.estimatedBatch.fingerprint.mean.toFixed(2)}
                     unit="m"
                     tone="brand"
-                    hint="same 400 test points"
+                    hint={`same ${BATCH_TRIALS} test points`}
                   />
                 </div>
                 <details className="text-xs">
@@ -858,7 +1002,12 @@ export default function WifiPositioningTab({ presentationMode = false }) {
                   <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1">
                     {calibration.estimates.map((item) => (
                       <div key={item.id} className="flex justify-between gap-2">
-                        <span>{item.id} · L{item.estimated.level}</span>
+                        <span>
+                          {item.id} · {levelShort(item.estimated.level)}
+                          {!item.floorCorrect && (
+                            <span className="text-bad"> (truth {levelShort(item.truth.level)})</span>
+                          )}
+                        </span>
                         <span className="tnum font-semibold text-ink">{item.errorM.toFixed(2)} m</span>
                       </div>
                     ))}
@@ -1090,6 +1239,8 @@ function ResultsTable({ batch }) {
         </table>
       </div>
 
+      <PerLevelTable batch={batch} />
+
       {tri.failures > 0 && (
         <p className="text-[11px] leading-snug text-ink-faint">
           Trilateration produced no answer at all in {tri.failures} of {batch.trials} tests: the
@@ -1128,6 +1279,73 @@ function ResultsTable({ batch }) {
           </span>
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * The same batch split by the level each test position was really on.
+ *
+ * The building-wide mean hides the level that matters most to a defence
+ * question: the car park has far fewer APs than the shop floors, so its accuracy
+ * is the honest worst case. Horizontal error and floor correctness stay in
+ * separate columns, as everywhere else in the app.
+ */
+function PerLevelTable({ batch }) {
+  const rows = LEVELS.map((l) => {
+    const results = batch.results.filter((r) => r.truth.level === l.level);
+    return {
+      level: l,
+      tests: results.length,
+      fp: summarise(results.map((r) => r.fpError)),
+      tri: summarise(results.map((r) => r.triError)),
+      floorCorrect: results.filter((r) => r.fpLevelCorrect).length / Math.max(1, results.length),
+    };
+  });
+  const fmt = (v, digits) => (Number.isFinite(v) ? `${v.toFixed(digits)} m` : '—');
+
+  return (
+    <div>
+      <div className="mb-1.5 text-[10px] font-bold uppercase tracking-[0.08em] text-ink-faint">
+        By level (where the test position really was)
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="border-b border-line text-left">
+              <th className="py-1.5 pr-2 font-semibold text-ink">Level</th>
+              <th className="py-1.5 pr-2 text-right font-semibold text-ink">APs on level</th>
+              <th className="py-1.5 pr-2 text-right font-semibold text-ink">Tests</th>
+              <th className="py-1.5 pr-2 text-right font-semibold text-good">Fingerprint mean</th>
+              <th className="py-1.5 pr-2 text-right font-semibold text-good">Correct floor</th>
+              <th className="py-1.5 text-right font-semibold text-bad">Trilateration mean</th>
+            </tr>
+          </thead>
+          <tbody className="tnum">
+            {rows.map((row) => (
+              <tr key={row.level.level} className="border-b border-line/60">
+                <td className="py-1.5 pr-2 text-ink-soft">{row.level.name}</td>
+                <td className="py-1.5 pr-2 text-right font-medium text-ink">
+                  {row.level.aps.length}
+                </td>
+                <td className="py-1.5 pr-2 text-right font-medium text-ink">{row.tests}</td>
+                <td className="py-1.5 pr-2 text-right font-medium text-ink">
+                  {fmt(row.fp.mean, 2)}
+                </td>
+                <td className="py-1.5 pr-2 text-right font-medium text-ink">
+                  {row.tests ? `${(row.floorCorrect * 100).toFixed(1)}%` : '—'}
+                </td>
+                <td className="py-1.5 text-right font-medium text-ink">{fmt(row.tri.mean, 1)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="mt-1.5 text-[11px] leading-snug text-ink-faint">
+        Every AP in the building is heard where its signal reaches, not only those on the
+        user&rsquo;s level — but fewer APs on a level means fewer strong, nearby readings to match
+        against there. Levels are drawn at random per test, so the counts differ slightly.
+      </p>
     </div>
   );
 }

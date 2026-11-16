@@ -23,10 +23,11 @@
  *   3. Project every shop door perpendicularly onto its corridor's centreline;
  *      that projection is an "access" node, and a short spur edge connects it to
  *      the door itself.
- *   4. Do the same for escalators, stairs and lifts.
+ *   4. Do the same for the connectors (escalators, stairs, lifts) on that floor.
  *   5. Sort the nodes along each centreline and connect consecutive pairs.
- *   6. Join the two levels by connecting each vertical link's node on Level 1 to
- *      its twin on Level 2.
+ *   6. Join the floors: every connector gets one edge between its stops on each
+ *      PAIR of floors it serves (any number of floors), costed by ride time and
+ *      directed for escalators, which only run one way.
  *
  * IN THE REAL PROJECT this same graph is produced from a floor plan IMAGE:
  * semantic segmentation to separate walls from walkable floor, then morphological
@@ -45,13 +46,23 @@ export const WALK_SPEED_MPS = 1.25;
 const MERGE_TOLERANCE_M = 0.6;
 
 /** @typedef {{ id: string, x: number, y: number, level: number, kind: string, label?: string, shopId?: string, linkId?: string }} NavNode */
-/** @typedef {{ id: string, from: string, to: string, cost: number, distanceM: number, kind: string, transport?: string, accessible: boolean }} NavEdge */
+/**
+ * A graph edge. Corridor and entrance edges carry only the first group of
+ * fields. Connector ('vertical') edges add which connector they ride, how many
+ * floors, the ride time, whether they are one-way, and whether the connector
+ * is in service per the floor-plan data.
+ *
+ * @typedef {{ id: string, from: string, to: string, cost: number, distanceM: number, kind: string, accessible: boolean,
+ *   transport?: string, connectorId?: string, floors?: number, seconds?: number, directed?: boolean, inService?: boolean, label?: string }} NavEdge
+ */
 
 /**
  * Build the navigation graph for the whole building (all levels).
  *
- * @param {object[]} levels level objects from floorplan.js
- * @param {object[]} verticalLinks escalator / stairs / lift definitions
+ * @param {object[]} levels level objects from floorplan.js, sorted by ordinal
+ * @param {object[]} verticalLinks the connectors (CONNECTORS in floorplan.js):
+ *   escalators, stairs and lifts, each with the floors it serves, its direction
+ *   and its timing. An empty list is fine (a one-floor plan).
  * @returns {{ nodes: NavNode[], edges: NavEdge[], nodeById: Map<string, NavNode>, adjacency: Map<string, NavEdge[]>, stats: object }}
  */
 export function buildNavGraph(levels, verticalLinks) {
@@ -551,7 +562,12 @@ export function splitRouteByLevel(graph, route) {
   return runs;
 }
 
-/** Human-readable summary of the connectors a route uses, with destination floor. */
+/**
+ * Human-readable summary of the connectors a route uses, one phrase per ride
+ * ("Up-escalator to L2, then Lift to P"), each naming the floor it arrives on.
+ * Callers should pass `levelName`: the default prints raw level identifiers,
+ * which are not floor names (the car park is level 0 but is called "P").
+ */
 export function describeTransports(route, levelName = (l) => `Level ${l}`) {
   if (!route || route.transports.length === 0) return 'Same level — no stairs or lift needed';
   return route.transports.map((t) => `${t.label} to ${levelName(t.toLevel)}`).join(', then ');
@@ -565,9 +581,14 @@ export function describeTransports(route, levelName = (l) => `Level ${l}`) {
  * multi-floor UX: a route is a sequence of per-floor legs joined by level
  * changes.
  *
+ * Ride steps appear in the same order as `route.transports`, one each, so a
+ * caller can pair the n-th ride step with the n-th transport (Tab 1 does, to
+ * split a ride's time into wait and travel).
+ *
  * @param {object} graph
  * @param {object} route result of findRoute
- * @param {(level: number) => string} levelName
+ * @param {(level: number) => string} levelName the floor's display name. Pass
+ *   one: the default prints raw level identifiers ("Level 0" for the car park).
  * @returns {{ kind: 'walk' | 'ride', text: string, level: number, metres?: number, seconds: number }[]}
  */
 export function routeInstructions(graph, route, levelName = (l) => `Level ${l}`) {
@@ -600,6 +621,8 @@ export function routeInstructions(graph, route, levelName = (l) => `Level ${l}`)
     }
     const ride = route.transports[rideIndex++];
     flushWalk(`to the ${edge.label.toLowerCase()}`);
+    // NOTE: compares level identifiers, which equal ordinals in this building.
+    // A building numbered out of stack order would need graph.ordinalByLevel here.
     const way = ride.toLevel > ride.fromLevel ? 'up' : 'down';
     const what = edge.transport === 'escalator' ? 'escalator' : edge.label.toLowerCase();
     steps.push({

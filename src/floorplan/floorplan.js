@@ -10,10 +10,12 @@
  *
  * The building
  * ------------
- * A two-level mall, 60 m x 40 m per level. Each level has one wide horizontal
- * corridor and one wide vertical corridor crossing it, forming a plus-shaped
- * walkable area. Shop units fill all four quadrants: some front the horizontal
- * corridor, some front the vertical corridor.
+ * A three-level mall, 60 m x 40 m per level: a basement car park (Level P) and
+ * two shopping floors above it (Level 1, the ground floor, and Level 2). Every
+ * level shares the same footprint. Each has one wide horizontal corridor and one
+ * wide vertical corridor crossing it, forming a plus-shaped walkable area. Units
+ * fill all four quadrants — shops on the upper floors, parking zones and service
+ * rooms in the car park: some front the horizontal corridor, some the vertical.
  *
  *   x --->            0                30                60
  *   y                 +-----------------+-----------------+  0
@@ -26,10 +28,11 @@
  *
  * Coordinates are metres, y grows downward (see geometry.js for why).
  *
- * The three levels of vertical circulation (escalator, stairs, lift) are what
- * make Tab 1's accessibility toggle meaningful: turning accessibility ON drops
- * the escalator and stairs, forcing the route to the lift, which is deliberately
- * placed far from the centre so the detour is visible.
+ * The three kinds of vertical circulation (escalators, stairs, lift) are what
+ * make step-free routing meaningful: a step-free route may not use the
+ * escalators or stairs, so it is forced to the lift, which is deliberately
+ * placed far from the centre so the detour is visible. They also serve
+ * different floors — the escalators do not reach the car park — see CONNECTORS.
  */
 
 /** @typedef {import('./geometry.js').Point} Point */
@@ -402,9 +405,13 @@ export const VERTICAL_LINKS = CONNECTORS;
 // ---------------------------------------------------------------------------
 
 /**
- * Seven ceiling-mounted access points per level, along the corridors — which is
- * where a mall's IT contractor actually puts them (power and cable trays follow
- * the corridors, not the tenant units).
+ * Ceiling-mounted access points along the corridors — which is where a mall's
+ * IT contractor actually puts them (power and cable trays follow the corridors,
+ * not the tenant units). Seven on each shopping floor, four in the car park.
+ *
+ * IDs are not in floor order: AP1–AP7 (L1) and AP8–AP14 (L2) predate the car
+ * park, whose APs became AP15–AP18 so that existing IDs kept their meaning.
+ * Code must therefore look APs up by `level`, never infer it from the number.
  *
  * The positions are intentionally NOT perfectly symmetric. Real deployments
  * never are, and the slight unevenness is what produces the weak coverage zones
@@ -611,7 +618,11 @@ export function getLevel(level) {
   return LEVELS.find((l) => l.level === level) ?? LEVELS.find((l) => l.level === GROUND_LEVEL);
 }
 
-/** Every access point on every level, flattened — used by Tab 2's radio map. */
+/**
+ * Every access point on every level, flattened — used by Tab 2's radio map.
+ * Follows LEVELS order (bottom-up), so ALL_APS[0] is a car-park AP, not AP1:
+ * pick a default AP by level, not by index.
+ */
 export const ALL_APS = LEVELS.flatMap((l) => l.aps);
 
 /** Every shop on every level, flattened — used to populate route dropdowns. */

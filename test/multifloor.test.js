@@ -134,3 +134,100 @@ test('routing every pair of shops in the building is fast', () => {
   // that would catch an accidental return to an O(n^2) frontier.
   assert.ok(ms < 1500, `all-pairs routing took ${ms.toFixed(0)} ms for ${routed} routes`);
 });
+
+// ---------------------------------------------------------------------------
+// Facts Tab 1's routing panel relies on
+// ---------------------------------------------------------------------------
+
+const levelName = (l) => getLevel(l).name;
+const doorOn = (level) => doors.find((d) => d.level === level);
+
+test('route instructions use the supplied floor names and never print a raw level number', () => {
+  // A marker name proves every floor reference goes through `levelName`; the
+  // car park is level 0 but must never be shown as "Level 0".
+  forEveryRoute({}, (route) => {
+    for (const step of routeInstructions(graph, route, (l) => `<${getLevel(l).shortName}>`)) {
+      assert.doesNotMatch(step.text, /Level \d/, step.text);
+      assert.match(step.text, /<(P|L1|L2)>/, step.text);
+    }
+  });
+  const toParking = findRoute(graph, doorOn(2).id, doorOn(0).id);
+  const text = routeInstructions(graph, toParking, levelName).map((s) => s.text).join(' | ');
+  assert.match(text, /Level P — Parking/);
+  assert.doesNotMatch(text, /Level 0/);
+});
+
+test('ride steps pair one-to-one, in order, with route.transports, and the steps add up to the route time', () => {
+  forEveryRoute({ profile: 'step-free' }, (route) => {
+    const steps = routeInstructions(graph, route, levelName);
+    const rides = steps.filter((s) => s.kind === 'ride');
+    rides.forEach((s, i) => {
+      assert.equal(s.seconds, route.transports[i].seconds);
+      assert.equal(s.level, route.transports[i].fromLevel);
+    });
+    // Walks under 0.5 m are dropped from the list, so allow that much slack per step.
+    const total = steps.reduce((sum, s) => sum + s.seconds, 0);
+    assert.ok(Math.abs(total - route.seconds) <= (steps.length + 1) * (0.5 / 1.25), `${total} vs ${route.seconds}`);
+  });
+});
+
+test('with every connector out of service, cross-floor trips have no route and same-floor trips still do', () => {
+  const allOff = CONNECTORS.map((c) => c.id);
+  for (const profile of Object.keys(ROUTE_PROFILES)) {
+    forEveryRoute({ profile, disabledConnectors: allOff }, (route, a, b) => {
+      if (a.level === b.level) assert.ok(route, `${profile}: same-floor ${a.id}->${b.id}`);
+      else assert.equal(route, null, `${profile}: ${a.id}->${b.id} must not route`);
+    });
+  }
+});
+
+test('profiles allow exactly the connectors their one-line descriptions promise', () => {
+  const allowedBy = (profile) =>
+    CONNECTORS.filter((c) =>
+      ROUTE_PROFILES[profile].allow(graph.edges.find((e) => e.connectorId === c.id)),
+    ).map((c) => c.id);
+  assert.deepEqual(allowedBy('fastest'), CONNECTORS.map((c) => c.id));
+  assert.deepEqual(allowedBy('step-free'), ['lift']);
+  assert.deepEqual(allowedBy('avoid-escalators'), ['stairs', 'lift']);
+});
+
+test('no-route explanations are backed by real counterfactuals', () => {
+  const parking = doorOn(0);
+  const top = doorOn(2);
+  // Step-free with the lift down: no route, but returning the lift restores one,
+  // and a non-step-free route exists that the UI must only OFFER.
+  assert.equal(findRoute(graph, parking.id, top.id, { profile: 'step-free', disabledConnectors: ['lift'] }), null);
+  assert.ok(findRoute(graph, parking.id, top.id, { profile: 'step-free' }));
+  const viaStairs = findRoute(graph, parking.id, top.id, { profile: 'fastest', disabledConnectors: ['lift'] });
+  assert.deepEqual(viaStairs.transports.map((t) => t.connectorId), ['stairs']);
+
+  // Everything off, going up from L1: the down-escalator alone cannot help
+  // (wrong way); each of the other three alone can.
+  const allOff = CONNECTORS.map((c) => c.id);
+  const l1 = doorOn(1);
+  const restores = (id) =>
+    !!findRoute(graph, l1.id, top.id, { disabledConnectors: allOff.filter((x) => x !== id) });
+  assert.deepEqual(allOff.filter(restores), ['escalator-up', 'stairs', 'lift']);
+
+  // The car park is not served by escalators, so with stairs and lift down it is cut off.
+  assert.equal(findRoute(graph, parking.id, top.id, { disabledConnectors: ['stairs', 'lift'] }), null);
+});
+
+test('the one-floor annex routes every pair with no connectors at all, and its directions name the annex', async () => {
+  const { ALTERNATE_LEVELS, ALTERNATE_VERTICAL_LINKS } = await import('../src/floorplan/alternateFloorplan.js');
+  const annex = buildNavGraph(ALTERNATE_LEVELS, ALTERNATE_VERTICAL_LINKS);
+  const annexDoors = annex.nodes.filter((n) => n.kind === 'door');
+  const name = (l) => ALTERNATE_LEVELS.find((x) => x.level === l).name;
+  for (const a of annexDoors) {
+    for (const b of annexDoors) {
+      if (a.id === b.id) continue;
+      const route = findRoute(annex, a.id, b.id, { profile: 'step-free' });
+      assert.ok(route, `${a.id}->${b.id}`);
+      assert.equal(route.transports.length, 0);
+      for (const step of routeInstructions(annex, route, name)) {
+        assert.equal(step.kind, 'walk');
+        assert.ok(step.text.includes(name(step.level)), step.text);
+      }
+    }
+  }
+});

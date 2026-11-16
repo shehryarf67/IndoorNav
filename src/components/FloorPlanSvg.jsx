@@ -11,6 +11,10 @@ import { VIEWBOX, ASPECT, CATEGORY_COLORS, BUILDING } from '../floorplan/floorpl
  *
  * All coordinates — both here and in every overlay — are in METRES, because the
  * viewBox is in metres. See the note on VIEWBOX in floorplan.js.
+ *
+ * `disabledConnectorIds` (optional, any iterable of connector ids) draws those
+ * connectors as out of service. It is purely visual: whether routing avoids them
+ * is decided by the caller passing the same ids to `findRoute`.
  */
 export default function FloorPlanSvg({
   level,
@@ -22,8 +26,10 @@ export default function FloorPlanSvg({
   dimShops = false,
   cursor = 'default',
   className = '',
+  disabledConnectorIds = NO_IDS,
 }) {
   const svgRef = useRef(null);
+  const disabled = new Set(disabledConnectorIds);
 
   /**
    * Convert a browser click into building coordinates (metres).
@@ -126,7 +132,11 @@ export default function FloorPlanSvg({
       {showVerticalLinks && (
         <g>
           {level.verticalLinks.map((v) => (
-            <VerticalLinkMarker key={v.id} link={v} />
+            <VerticalLinkMarker
+              key={v.id}
+              link={v}
+              outOfService={v.inService === false || disabled.has(v.id)}
+            />
           ))}
         </g>
       )}
@@ -145,6 +155,9 @@ export default function FloorPlanSvg({
     </svg>
   );
 }
+
+/** Shared empty default, so the prop's default is stable between renders. */
+const NO_IDS = [];
 
 /** Shop name, wrapped onto two lines if it won't fit the unit's frontage. */
 function ShopLabel({ shop }) {
@@ -182,35 +195,171 @@ function chunkWords(words) {
   return [words.slice(0, mid).join(' '), words.slice(mid).join(' ')];
 }
 
-/** Escalator / stairs / lift marker. Shape encodes the type. */
-function VerticalLinkMarker({ link }) {
+/**
+ * Escalator / stairs / lift marker. Shape and glyph encode the type.
+ *
+ * The up- and down-escalators stand side by side only 3.6 m apart, with an AP
+ * ceiling-mounted between them on Level 2 (AP13 at (30, 8)). So escalators get
+ * a NARROW box (1.8 m wide — roughly an escalator's real footprint across its
+ * width) and a drawn arrow for their direction of travel between floors, and
+ * every marker is captioned with the connector's short label. With the full
+ * labels and 3 m boxes, the two captions overprinted each other and the AP dot
+ * sat on top of both boxes.
+ *
+ * The arrow is a path, not a font glyph, so it looks the same on every machine
+ * and survives the graph node dot Tab 1 draws over the marker's centre (the
+ * arrowhead stays visible above / below the dot).
+ */
+function VerticalLinkMarker({ link, outOfService = false }) {
+  const isEscalator = link.type === 'escalator';
+  const oneWay = isEscalator && (link.direction === 'up' || link.direction === 'down');
+  const halfW = isEscalator ? 0.9 : 1.5;
+  const halfH = isEscalator ? 1.6 : 1.5;
   const glyph = { escalator: '⇅', stairs: '⌃', lift: '⊞' }[link.type] ?? '⇅';
+  const caption = link.shortLabel ?? link.label;
+
+  const style = outOfService
+    ? CONNECTOR_STYLE.closed
+    : link.accessible
+      ? CONNECTOR_STYLE.stepFree
+      : CONNECTOR_STYLE.stepped;
+  const { fill, stroke, ink } = style;
+
   return (
     <g style={{ pointerEvents: 'none' }}>
       <rect
-        x={link.x - 1.5}
-        y={link.y - 1.5}
-        width={3}
-        height={3}
+        x={link.x - halfW}
+        y={link.y - halfH}
+        width={halfW * 2}
+        height={halfH * 2}
         rx={0.4}
-        fill={link.accessible ? '#dbeafe' : '#e2e8f0'}
-        stroke={link.accessible ? '#2563eb' : '#64748b'}
+        fill={fill}
+        stroke={stroke}
         strokeWidth={1.2}
+        strokeDasharray={outOfService ? '3 2' : undefined}
         vectorEffect="non-scaling-stroke"
       />
+      {oneWay ? (
+        <EscalatorArrow x={link.x} y={link.y} up={link.direction === 'up'} color={ink} />
+      ) : (
+        <text x={link.x} y={link.y + 0.6} textAnchor="middle" fontSize={1.9} fill={ink}>
+          {glyph}
+        </text>
+      )}
+      {outOfService && (
+        // A red cross over the whole box: "closed" must read at a glance, even
+        // for a viewer who never opens the legend.
+        <g stroke="#dc2626" strokeWidth={2} strokeLinecap="round">
+          <line
+            x1={link.x - halfW}
+            y1={link.y - halfH}
+            x2={link.x + halfW}
+            y2={link.y + halfH}
+            vectorEffect="non-scaling-stroke"
+          />
+          <line
+            x1={link.x + halfW}
+            y1={link.y - halfH}
+            x2={link.x - halfW}
+            y2={link.y + halfH}
+            vectorEffect="non-scaling-stroke"
+          />
+        </g>
+      )}
       <text
         x={link.x}
-        y={link.y + 0.6}
+        y={link.y + halfH + 1.6}
         textAnchor="middle"
-        fontSize={1.9}
-        fill={link.accessible ? '#1d4ed8' : '#334155'}
+        fontSize={0.95}
+        fill={outOfService ? '#dc2626' : '#64748b'}
+        textDecoration={outOfService ? 'line-through' : undefined}
       >
-        {glyph}
-      </text>
-      <text x={link.x} y={link.y + 3.1} textAnchor="middle" fontSize={0.95} fill="#64748b">
-        {link.label}
+        {caption}
       </text>
     </g>
+  );
+}
+
+/**
+ * Marker colours, shared by the marker and its legend entries so the two
+ * cannot drift apart. Blue is reserved for step-free connectors (the lift),
+ * because that is the one property a wheelchair user scans the plan for.
+ */
+const CONNECTOR_STYLE = {
+  stepFree: { fill: '#dbeafe', stroke: '#2563eb', ink: '#1d4ed8' },
+  stepped: { fill: '#e2e8f0', stroke: '#64748b', ink: '#334155' },
+  closed: { fill: '#f8fafc', stroke: '#94a3b8', ink: '#94a3b8' },
+};
+
+/**
+ * Legend entries for the connector markers above, in ExplainerPanel's legend
+ * item shape. VerticalLinkMarker is drawn by every tab that shows the plan, so
+ * every such tab must explain it; each tab spreads this one array into its
+ * ExplainerPanel `legend` instead of keeping its own copy.
+ *
+ * The arrow note matters on a plan view: without it an up arrow reads as
+ * "north". Captions quote the connectors' shortLabel from floorplan.js.
+ */
+const CONNECTOR_LEGEND = [
+  {
+    kind: 'glyph',
+    glyph: '⊞',
+    color: CONNECTOR_STYLE.stepFree.ink,
+    color2: CONNECTOR_STYLE.stepFree.fill,
+    label: 'Lift (step-free)',
+    desc: 'blue = step-free, the only connector a step-free route may use. It stops on every floor',
+  },
+  {
+    kind: 'glyph',
+    glyph: '↑',
+    color: CONNECTOR_STYLE.stepped.ink,
+    label: 'Up-escalator ("Esc ↑")',
+    desc: 'one-way, from the floor below to the floor above. The arrow is its direction of travel between floors, not a compass direction',
+  },
+  {
+    kind: 'glyph',
+    glyph: '↓',
+    color: CONNECTOR_STYLE.stepped.ink,
+    label: 'Down-escalator ("Esc ↓")',
+    desc: 'its one-way partner beside it; routing never sends anyone up it',
+  },
+  {
+    kind: 'glyph',
+    glyph: '⌃',
+    color: CONNECTOR_STYLE.stepped.ink,
+    label: 'Stairs',
+    desc: 'two-way and reach every floor including the car park, but have steps',
+  },
+];
+
+/**
+ * Extra entry for tabs that can mark connectors out of service (Tab 1 today).
+ * Kept separate so a tab that never shows a closed connector does not explain
+ * a symbol the viewer cannot see.
+ */
+const CONNECTOR_OUT_OF_SERVICE_LEGEND = {
+  kind: 'cross',
+  color: '#dc2626',
+  label: 'Out-of-service connector',
+  desc: 'red cross, dashed outline and struck-through caption — marked out of service, so routing will not use it',
+};
+
+/** Direction-of-travel arrow drawn inside an escalator marker (metres). */
+function EscalatorArrow({ x, y, up, color }) {
+  // Tip and tail 1.1 m either side of centre; the head is 0.55 m deep.
+  const tip = up ? y - 1.1 : y + 1.1;
+  const tail = up ? y + 1.1 : y - 1.1;
+  const back = up ? tip + 0.55 : tip - 0.55;
+  return (
+    <path
+      d={`M ${x} ${tail} L ${x} ${tip} M ${x - 0.55} ${back} L ${x} ${tip} L ${x + 0.55} ${back}`}
+      fill="none"
+      stroke={color}
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      vectorEffect="non-scaling-stroke"
+    />
   );
 }
 
@@ -245,4 +394,4 @@ function ApMarker({ ap, highlighted = false }) {
   );
 }
 
-export { ApMarker, VerticalLinkMarker };
+export { ApMarker, VerticalLinkMarker, CONNECTOR_LEGEND, CONNECTOR_OUT_OF_SERVICE_LEGEND };

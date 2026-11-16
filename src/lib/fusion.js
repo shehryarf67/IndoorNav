@@ -47,6 +47,7 @@ import {
   initParticlesAt,
   initParticlesLost,
   propagate,
+  diffuseHeading,
   applyMapConstraint,
   replenish,
   applyWifi,
@@ -132,12 +133,74 @@ export const FLOOR_DETECTOR = {
   driftTrackingS: 60,
   /** Classifier: vertical speed above this means a lift rather than an escalator. */
   liftSpeedMps: 0.32,
-  /** Classifier: more than this many steps per metre climbed means stairs. */
-  stairsStepsPerMetre: 1,
+  /**
+   * Height of a typical stair riser, metres. Building codes allow about
+   * 0.15–0.19 m. This is the app's general knowledge about stairs, not a value
+   * read from the simulation (which happens to build its stairs to the same
+   * figure, STAIR_RISER_M).
+   */
+  typicalRiserM: 0.17,
+  /**
+   * Classifier: more than this many steps per metre climbed means stairs.
+   *
+   * Lifts and escalators climb with no steps (0 steps/m); stairs take one step
+   * per riser (~5.9 steps/m). Half of the stairs figure is the natural boundary.
+   * It used to be 1 step/m, which sat so close to zero that the few steps of
+   * walking leaking in when the arrival time is estimated late (2.3 s late in
+   * the worst case seen: 4 steps over a 3.7 m climb, 1.08 steps/m) turned an
+   * escalator ride into "stairs".
+   */
+  stairsStepsPerMetre: 0.5 / 0.17,
+  /**
+   * Height gained per step above which a step counts as CLIMBING rather than
+   * walking, metres: half a typical riser, midway between flat walking (0 m)
+   * and stairs (0.17 m). Measured over the rate window, the per-step climb has
+   * a standard deviation of ~0.03 m when walking on the flat and ~0.06 m on
+   * stairs, so flat walking crosses this line on ~0.6% of ticks and stairs fall
+   * short of it on ~9%.
+   */
+  climbPerStepM: 0.17 / 2,
+  /**
+   * Window for the "stopped" test during a STAIR climb, seconds.
+   *
+   * Stairs climb at ~0.15 m/s, and over a 2 s window the rate estimate's noise
+   * is 0.055 m/s (measured), so a stair climb read below the 0.08 m/s
+   * "stopped" line on 10% of ticks and was regularly confirmed mid-flight: 98
+   * of 100 simulated two-floor stair descents were split into two one-floor
+   * changes. Measured noise on a 0.15 m/s climb, by window: 5 s 0.029 m/s,
+   * 8 s 0.021 m/s, 10 s 0.018 m/s — it falls more slowly than 1/window because
+   * the weather drift is a random walk. Eight seconds is the shortest window
+   * that puts the stopped line over three standard deviations away (199 of 200
+   * two-floor descents confirmed once). It costs about three seconds of
+   * latency, so it is only used once the steps already say "stairs"; lift and
+   * escalator rides keep the 2 s window.
+   */
+  stairsRateWindowS: 8,
+  /**
+   * How long a transition must sit still, short of any whole floor, before it
+   * is treated as a remnant and absorbed (see updateFloorDetector), seconds.
+   * Deliberately long: a remnant stays still for as long as the user keeps
+   * walking on the flat, so waiting costs nothing, while a genuine climb
+   * almost never looks still for ten seconds. With the 1 s settle hold
+   * instead, noisy dips early in stair climbs were absorbed and 14 of 200
+   * simulated one-floor stair climbs went undetected.
+   */
+  remnantHoldS: 10,
 };
 
 /** Stride length the phone's step counter ASSUMES, in metres. */
 export const STRIDE_M = 0.72;
+
+/**
+ * The building's stairs, as the HARDWARE simulation sees them: one step per
+ * 0.17 m riser, in an enclosed dog-leg stair core of two flights per storey
+ * that run in opposite directions along the corridor axis. The core is a few
+ * metres long, small next to the corridors, so the walk keeps the shopper at
+ * the connector's (x, y) — but the phone in their hand still points along
+ * each flight, which is what its compass reports.
+ */
+export const STAIR_RISER_M = 0.17;
+export const STAIR_FLIGHTS_PER_STOREY = 2;
 
 /**
  * THE REAL SENSOR ERRORS — the ground truth of how bad the hardware is.
@@ -196,7 +259,7 @@ export const QR_RADIUS_M = 1.8;
  * floors, with `via` naming the connector ridden. The ride then takes that
  * connector's own time, so the walk, the router and the barometer all agree.
  *
- * Both routes include right-angle turns on purpose: heading error is what makes
+ * Every route includes right-angle turns on purpose: heading error is what makes
  * dead reckoning drift, and corners are also what let map matching correct it —
  * straight-line routes would misrepresent both.
  */
@@ -234,6 +297,28 @@ export const WALK_ROUTES = {
       { x: 6.23, y: 16.5, level: 2, note: 'Cinepax Cinema' },
     ],
   },
+  stairs: {
+    // Leaving after lunch: from the food court down the stairs, two floors, to
+    // the car park. The only route that climbs on foot, so it is the one that
+    // exercises the stairs classifier and the barometer gate on dead reckoning
+    // (a step counter reports every stair step as a stride). Waypoints are the
+    // Food Court and Parking Zone D door nodes from floorplan.js, joined along
+    // the corridor centrelines (y = 20, x = 30).
+    id: 'stairs',
+    label: 'Food court → Parking Zone D',
+    summary: 'Level 2, stairs down two floors, car park',
+    bootstrapAnchorId: 'qr-6',
+    waypoints: [
+      { x: 9.5, y: 23.5, level: 2, note: 'Food Court' },
+      { x: 9.5, y: 20, level: 2, note: 'Level 2 west concourse' },
+      { x: 30, y: 20, level: 2, note: 'Level 2 atrium' },
+      { x: 30, y: 31, level: 2, note: 'Stairs (Level 2)' },
+      { x: 30, y: 31, level: 0, note: 'Stairs (Level P)', via: 'stairs' },
+      { x: 30, y: 20, level: 0, note: 'Car park crossing' },
+      { x: 50.5, y: 20, level: 0, note: 'Car park east concourse' },
+      { x: 50.5, y: 23.5, level: 0, note: 'Parking Zone D' },
+    ],
+  },
 };
 
 /** The default walk. Kept as an export because older code imports it. */
@@ -254,6 +339,8 @@ export const QR_ANCHORS = [
   { id: 'qr-4', level: 2, x: 30, y: 20, label: 'Level 2 atrium' },
   { id: 'qr-p1', level: 0, x: 9.5, y: 22, label: 'Car park pay station' },
   { id: 'qr-5', level: 2, x: 44.83, y: 20, label: 'East pillar' },
+  // Outside the food court: the stairs walk starts here, 1.5 m from the code.
+  { id: 'qr-6', level: 2, x: 9.5, y: 22, label: 'Food court directory' },
 ];
 
 /**
@@ -331,6 +418,15 @@ export function samplePlan(plan, t) {
     const elapsed = clamped - leg.tStart;
     const travel = span - leg.waitS;
     const climb = travel > 0 ? Math.min(1, Math.max(0, (elapsed - leg.waitS) / travel)) : 1;
+    // On stairs the phone faces along the flight being climbed: the first
+    // flight runs north up the corridor axis, the next back south, and so on.
+    let heading = 0;
+    if (leg.connectorType === 'stairs') {
+      const flights =
+        Math.round((Math.abs(leg.toElevationM - leg.fromElevationM) / FLOOR_HEIGHT_M) * STAIR_FLIGHTS_PER_STOREY) || 1;
+      const flight = Math.min(flights - 1, Math.floor(climb * flights));
+      heading = flight % 2 === 0 ? -Math.PI / 2 : Math.PI / 2;
+    }
     return {
       x: leg.from.x,
       y: leg.from.y,
@@ -338,7 +434,7 @@ export function samplePlan(plan, t) {
       // estimate gets a genuine chance to be caught on the wrong floor.
       level: u >= 1 ? leg.to.level : leg.from.level,
       elevationM: leg.fromElevationM + (leg.toElevationM - leg.fromElevationM) * climb,
-      heading: 0,
+      heading,
       riding: true,
       connectorType: leg.connectorType,
       finished: clamped >= plan.totalSeconds,
@@ -421,24 +517,58 @@ export function updateFloorDetector(prevState, pressureHpa, t, dt, stepCount) {
 
   // Recent history of smoothed height and step count: the rate window for
   // detecting "stopped", plus enough extra to look back for the arrival time.
-  const history = [...prev.history, { t, h: relativeHeightM, steps: stepCount }].filter(
+  let history = [...prev.history, { t, h: relativeHeightM, steps: stepCount }].filter(
     (p) => p.t >= t - cfg.historyS - 1e-9,
   );
-  const windowStart = history.find((p) => p.t >= t - cfg.rateWindowS - 1e-9) ?? history[0];
-  const rateMps = t > windowStart.t ? (relativeHeightM - windowStart.h) / (t - windowStart.t) : 0;
-  const windowFull = t - history[0].t >= cfg.rateWindowS - 1e-6;
-  const speed = Math.abs(rateMps);
-  // Hysteresis: once still, you stay still until clearly moving again.
-  const wasStill = prev.settledSince !== null && prev.settledSince !== undefined;
-  const still = windowFull && speed < (wasStill ? cfg.movingRateMps : cfg.settledRateMps);
+  const rateOver = (windowS) => {
+    const start = history.find((p) => p.t >= t - windowS - 1e-9) ?? history[0];
+    return {
+      start,
+      rate: t > start.t ? (relativeHeightM - start.h) / (t - start.t) : 0,
+      full: t - history[0].t >= windowS - 1e-6,
+    };
+  };
+  const short = rateOver(cfg.rateWindowS);
+  const rateMps = short.rate;
+
+  // Is the user climbing on foot RIGHT NOW? Height gained per step over the
+  // rate window. This is what lets dead reckoning ignore stair steps (see
+  // stepFusion): the barometer, not the step counter, knows the step went up.
+  const windowSteps = stepCount - short.start.steps;
+  const climbPerStepM = windowSteps >= 1 ? (relativeHeightM - short.start.h) / windowSteps : 0;
+  const climbing = short.full && windowSteps >= 1 && Math.abs(climbPerStepM) > cfg.climbPerStepM;
 
   let transition = prev.transition;
-  let settledSince = still ? (prev.settledSince ?? t) : null;
-  let confirmed = null;
-
   if (!transition && Math.abs(relativeHeightM) > cfg.startThresholdM) {
     transition = { startT: t, startSteps: stepCount };
   }
+
+  // Does the transition under way look like stairs so far? Same steps-per-metre
+  // rule as the classifier, applied to the climb up to now.
+  const stairClimb =
+    !!transition &&
+    (stepCount - transition.startSteps) /
+      Math.max(0.5, Math.abs(relativeHeightM) - cfg.startThresholdM) >
+      cfg.stairsStepsPerMetre;
+
+  // Stairs are slow enough that the 2 s rate is too noisy to call "stopped"
+  // reliably; use the longer window once the steps say this is a stair climb.
+  const settleWindowS = stairClimb ? cfg.stairsRateWindowS : cfg.rateWindowS;
+  const settle = settleWindowS === cfg.rateWindowS ? short : rateOver(settleWindowS);
+  const speed = Math.abs(settle.rate);
+  // Hysteresis: once still, you stay still until clearly moving again. The gap
+  // exists to ride out noise in the rate, and that noise shrinks in proportion
+  // to the window, so the gap does too. (Left at full width, the 0.15 m/s
+  // "moving again" line sat exactly at stair-climbing speed, so one noisy dip
+  // could hold a stair climb "still" long enough to confirm it mid-flight.)
+  const hysteresisM =
+    (cfg.movingRateMps - cfg.settledRateMps) * (cfg.rateWindowS / settleWindowS);
+  const wasStill = prev.settledSince !== null && prev.settledSince !== undefined;
+  const still =
+    settle.full && speed < cfg.settledRateMps + (wasStill ? hysteresisM : 0);
+
+  let settledSince = still ? (prev.settledSince ?? t) : null;
+  let confirmed = null;
 
   const floors = Math.round(relativeHeightM / FLOOR_HEIGHT_M);
   const nearWholeFloor =
@@ -482,6 +612,9 @@ export function updateFloorDetector(prevState, pressureHpa, t, dt, stepCount) {
       smoothedHpa,
       relativeHeightM: 0,
       rateMps: 0,
+      climbPerStepM: 0,
+      climbing: false,
+      stairClimb: false,
       history: [{ t, h: 0, steps: stepCount }],
       settledSince: null,
       transition: null,
@@ -492,6 +625,29 @@ export function updateFloorDetector(prevState, pressureHpa, t, dt, stepCount) {
   // A transition that never got near a whole floor and has stopped (a ramp, a
   // pressure gust from a door) is abandoned.
   if (transition && still && Math.abs(relativeHeightM) < cfg.startThresholdM) transition = null;
+
+  // A transition that has stopped above the start threshold but no more than
+  // (1 − confirmFraction) of a storey up is a REMNANT, not a floor change: the
+  // last metre of a ride whose floor change was confirmed a moment early (a
+  // noisy dip in the rate can do that mid-escalator). Left open it never
+  // confirms, never abandons, blocks drift tracking and — worse — keeps the
+  // step gate below holding back ordinary walking. Absorb it: re-anchor here.
+  // The bound is exactly the shortfall a confirmed floor can have, so a genuine
+  // climb paused at a landing above it is never mistaken for a remnant — and
+  // one paused below it still has enough height left to confirm.
+  if (
+    transition &&
+    !nearWholeFloor &&
+    settledSince !== null &&
+    t - settledSince >= cfg.remnantHoldS &&
+    Math.abs(relativeHeightM) <= (1 - cfg.confirmFraction) * FLOOR_HEIGHT_M
+  ) {
+    transition = null;
+    referenceHpa = smoothedHpa;
+    relativeHeightM = 0;
+    history = [{ t, h: 0, steps: stepCount }];
+    settledSince = null;
+  }
 
   // Standing still with no transition under way: let the reference follow the
   // reading very slowly, cancelling weather drift.
@@ -505,6 +661,12 @@ export function updateFloorDetector(prevState, pressureHpa, t, dt, stepCount) {
     smoothedHpa,
     relativeHeightM,
     rateMps,
+    /** Height gained per step over the rate window, metres (0 with no steps). */
+    climbPerStepM,
+    /** The steps in the rate window are climbing, not walking. */
+    climbing,
+    /** A transition is under way and its steps-per-metre say stairs. */
+    stairClimb: stairClimb && !!transition,
     history,
     settledSince,
     transition,
@@ -561,6 +723,13 @@ export function initFusionState(plan, seed = 7, layers = { qr: true }, ctx = nul
     compassError: 0,
 
     stepCount: 0,
+    /**
+     * Steps NOT propagated as horizontal travel because the barometer showed
+     * the user climbing (barometer-gated dead reckoning), and whether this
+     * tick's steps were held back. Both come from the app's own barometer.
+     */
+    gatedStepCount: 0,
+    stepsGated: false,
     lastWifiT: -Infinity,
     /**
      * When the next Wi-Fi scan result arrives. Scans come on the OS's schedule,
@@ -583,10 +752,16 @@ export function initFusionState(plan, seed = 7, layers = { qr: true }, ctx = nul
       referenceHpa: firstPressure,
       smoothedHpa: firstPressure,
       relativeHeightM: 0,
+      rateMps: 0,
+      climbPerStepM: 0,
+      climbing: false,
+      stairClimb: false,
       history: [{ t: 0, h: 0, steps: 0 }],
       settledSince: null,
       transition: null,
     },
+    /** The app's floor when the current climb began (null when none is under way yet). */
+    baroFromLevel: null,
     floorChangeCount: 0,
     /** Detected floor changes, for the UI: when, how many floors, which way, how. */
     floorChanges: [],
@@ -646,7 +821,9 @@ export function initFusionState(plan, seed = 7, layers = { qr: true }, ctx = nul
  * @param {object} state previous state (not mutated)
  * @param {number} dt seconds to advance
  * @param {object} plan from buildWalkPlan
- * @param {{dr:boolean, qr:boolean, wifi:boolean, mapMatch:boolean}} layers
+ * @param {{dr:boolean, qr:boolean, wifi:boolean, mapMatch:boolean, baro?:boolean, baroGate?:boolean}} layers
+ *   `baroGate` (default on whenever `baro` is on): hold back steps the
+ *   barometer shows to be climbing. Set it to false to see stairs drag the dot.
  * @param {object} ctx from buildFusionContext
  * @param {number} wifiIntervalS scan interval in seconds
  */
@@ -667,8 +844,21 @@ export function stepFusion(state, dt, plan, layers, ctx, wifiIntervalS = DEFAULT
   let measuredHeading = null;
   let measuredMetres = 0;
 
-  if (walkedM > 0) {
-    const steps = walkedM / STRIDE_M;
+  // Climbing stairs is stepping too: one step per riser, even though the
+  // shopper covers no horizontal distance. A phone's step counter cannot tell a
+  // stair step from a walking step, so it reports each one as a full stride
+  // along the compass heading — exactly the mistake real pedestrian dead
+  // reckoning makes on stairs. The software has to catch it (see the gate
+  // below); the hardware does not.
+  const onStairs = s.truth.riding && s.truth.connectorType === 'stairs';
+  const steps =
+    walkedM > 0
+      ? walkedM / STRIDE_M
+      : onStairs
+        ? Math.abs(s.truth.elevationM - (prevTruth.elevationM ?? s.truth.elevationM)) / STAIR_RISER_M
+        : 0;
+
+  if (steps > 0) {
     s.stepCount += steps;
 
     // The compass error random-walks: this is the thing that makes unaided dead
@@ -678,18 +868,12 @@ export function stepFusion(state, dt, plan, layers, ctx, wifiIntervalS = DEFAULT
 
     measuredHeading =
       s.truth.heading + s.compassError + gaussian(s.rng) * SENSOR_ERROR.compassNoise;
+    // Steps × the assumed stride. (When walking that is the distance walked,
+    // so it is written that way to keep the walking arithmetic bit-identical.)
     measuredMetres =
-      walkedM *
+      (walkedM > 0 ? walkedM : steps * STRIDE_M) *
       SENSOR_ERROR.strideScaleBias *
       (1 + gaussian(s.rng) * SENSOR_ERROR.strideNoise * Math.sqrt(steps));
-  }
-
-  // Climbing stairs is stepping, even though no horizontal distance is covered:
-  // ~0.17 m per riser. The floor-change classifier uses this to tell stairs from
-  // an escalator. (Deliberately NOT fed to dead reckoning — real step counters
-  // make exactly that mistake on stairs, and modelling it is future work.)
-  if (s.truth.riding && s.truth.connectorType === 'stairs') {
-    s.stepCount += Math.abs(s.truth.elevationM - (prevTruth.elevationM ?? 0)) / 0.17;
   }
 
   // The barometer: pressure from true height, plus wandering weather/HVAC drift,
@@ -703,22 +887,58 @@ export function stepFusion(state, dt, plan, layers, ctx, wifiIntervalS = DEFAULT
     s.pressureDriftHpa +
     (gaussian(s.rng) * BAROMETER.noiseHpa) / Math.sqrt(samplesThisTick);
 
+  // ---- The app reads its barometer ---------------------------------------
+  //
+  // Every tick (the reading is free), and BEFORE dead reckoning, because dead
+  // reckoning now asks it whether this tick's steps went up or along. Whether
+  // a confirmed floor change is acted on is decided further down.
+  s.baro = updateFloorDetector(state.baro, s.pressureHpa, s.t, dt, s.stepCount);
+  // Remember which floor the app believed it was on when a climb began: the
+  // barometer measures height change from there, so a confirmed change is
+  // applied from there (see applyFloorTransition's `fromLevel`).
+  if (s.baro.transition && !state.baro?.transition) s.baroFromLevel = state.est.level;
+
+  // ---- Barometer-gated dead reckoning ------------------------------------
+  //
+  // A step taken while the barometer shows the user climbing on foot is a
+  // stair step, not a stride, so it is not propagated as horizontal travel.
+  // Uses only the app's own barometer reading — height gained per step, and
+  // whether a stair-like floor change is still moving — never the true
+  // elevation. (A stair climb that has gone still is over: those steps are the
+  // walk away from the stairs.) Gated steps are still logged: if the floor
+  // change is later confirmed with an arrival time BEFORE them, they were
+  // walking after all and are replayed with the rest.
+  const gateOn = !!layers.baro && layers.baroGate !== false;
+  const stairClimbMoving = s.baro.stairClimb && s.baro.settledSince === null;
+  const stepIsVertical =
+    gateOn && measuredHeading !== null && (s.baro.climbing || stairClimbMoving);
+  s.stepsGated = stepIsVertical;
+  s.gatedStepCount = (state.gatedStepCount ?? 0) + (stepIsVertical ? steps : 0);
+
   // A short log of what dead reckoning measured, so a floor change confirmed a
   // few seconds late can replay the walking done since the user actually
-  // stepped off (see the barometer block below).
+  // stepped off (see the barometer block below). `applied` records whether the
+  // step actually moved the particles.
   s.drLog = (state.drLog ?? []).filter((e) => e.t >= s.t - 12);
   if (measuredHeading !== null) {
-    s.drLog = [...s.drLog, { t: s.t, heading: measuredHeading, metres: measuredMetres }];
+    s.drLog = [
+      ...s.drLog,
+      { t: s.t, heading: measuredHeading, metres: measuredMetres, applied: !stepIsVertical },
+    ];
   }
 
   let particles = state.particles;
 
   // ---- Layer 2: dead reckoning = the filter's prediction step -------------
   let moved = null;
-  if (layers.dr && measuredHeading !== null) {
+  if (layers.dr && measuredHeading !== null && !stepIsVertical) {
     const result = propagate(particles, measuredHeading, measuredMetres, s.rng);
     particles = result.particles;
     moved = result.moved;
+  } else if (layers.dr && stepIsVertical) {
+    // Held-back stair steps move nobody, but the compass model still ages by
+    // them (see diffuseHeading).
+    particles = diffuseHeading(particles, steps, s.rng);
   }
 
   // ---- Layer 4: map matching = delete the impossible ----------------------
@@ -743,11 +963,10 @@ export function stepFusion(state, dt, plan, layers, ctx, wifiIntervalS = DEFAULT
     s.survivedFraction = 1;
   }
 
-  // ---- Barometer: detect floor changes from relative pressure -------------
+  // ---- Barometer: act on a confirmed floor change -------------------------
   //
-  // Runs every tick (the reading is free), but only ACTS on the particles when
+  // The detector ran above; a confirmed change only ACTS on the particles when
   // the barometer layer is on — so the UI can compare with and without it.
-  s.baro = updateFloorDetector(state.baro, s.pressureHpa, s.t, dt, s.stepCount);
   const detected = s.baro.confirmed;
   if (detected && layers.baro) {
     // Each particle is judged from where IT thinks the user was when they
@@ -755,7 +974,11 @@ export function stepFusion(state, dt, plan, layers, ctx, wifiIntervalS = DEFAULT
     // arrival, and by then the user has walked metres away from the connector.
     // Undo each particle's own dead-reckoning since arrival (using its own
     // compass and stride hypotheses), run the transition there, then replay.
-    const sinceArrival = layers.dr ? s.drLog.filter((e) => e.t > detected.arrivalT) : [];
+    // Only steps that were actually applied are undone; gated ones never moved
+    // the particles.
+    const sinceArrival = layers.dr
+      ? s.drLog.filter((e) => e.t > detected.arrivalT && e.applied !== false)
+      : [];
     const atArrival = particles.map((p) => {
       let x = p.x;
       let y = p.y;
@@ -774,6 +997,7 @@ export function stepFusion(state, dt, plan, layers, ctx, wifiIntervalS = DEFAULT
         ordinalByLevel: ctx.ordinalByLevel,
         levelByOrdinal: ctx.levelByOrdinal,
         spreadM: state.spreadM ?? 3,
+        fromLevel: s.baroFromLevel ?? undefined,
       },
       s.rng,
     );
@@ -782,7 +1006,9 @@ export function stepFusion(state, dt, plan, layers, ctx, wifiIntervalS = DEFAULT
     // The cloud is now at the connector — where the user was when they ARRIVED,
     // a couple of seconds ago. Replay the steps taken since, through the same
     // prediction and map-matching operations, so the cloud catches up with
-    // where they are now instead of being dragged back to the escalator.
+    // where they are now instead of being dragged back to the escalator. Steps
+    // the barometer gate held back are replayed too if they came after the
+    // arrival: they were the first strides off the stairs, not stair steps.
     let replayed = 0;
     if (layers.dr) {
       for (const entry of s.drLog) {
@@ -797,10 +1023,22 @@ export function stepFusion(state, dt, plan, layers, ctx, wifiIntervalS = DEFAULT
       }
     }
 
-    s.floorChangeCount += 1;
-    const used = CONNECTORS.find((c) => c.id === result.connectorId);
     const way = detected.floors > 0 ? 'up' : 'down';
     const n = Math.abs(detected.floors);
+
+    // No floor the cloud holds has a connector that could make this trip, so
+    // the particles came back unchanged. Say so honestly rather than count,
+    // log and flash a floor change that never happened; Wi-Fi re-localisation
+    // remains the safety net.
+    if (result.applied === false) {
+      pushEvent(
+        s,
+        'baro',
+        `Pressure says ${way} ${n} floor${n > 1 ? 's' : ''}, but no connector could take any current hypothesis there — floor left unchanged; waiting for Wi-Fi to re-localise`,
+      );
+    } else {
+    s.floorChangeCount += 1;
+    const used = CONNECTORS.find((c) => c.id === result.connectorId);
     s.floorChanges = [
       ...s.floorChanges,
       { t: s.t, floors: detected.floors, type: detected.type, connectorId: result.connectorId },
@@ -814,6 +1052,7 @@ export function stepFusion(state, dt, plan, layers, ctx, wifiIntervalS = DEFAULT
         ? `Pressure says ${way} ${n} floor${n > 1 ? 's' : ''} (${detected.type}), but no hypothesis was near a connector — spread the cloud over every connector that could have done it`
         : `Pressure says ${way} ${n} floor${n > 1 ? 's' : ''}, looks like ${detected.type}. ${result.survived} of ${state.particles.length} hypotheses were near a connector that could do that; moved there, then replayed the ${replayed.toFixed(1)} m walked since arriving`,
     );
+    }
   }
 
   // ---- Layer 3: Wi-Fi = the filter's correction step ----------------------
@@ -854,6 +1093,11 @@ export function stepFusion(state, dt, plan, layers, ctx, wifiIntervalS = DEFAULT
     particles = result.particles;
 
     if (result.relocalized) {
+      // The rebuilt cloud sits where the user is NOW, so every logged step is
+      // already reflected in it — including steps the barometer gate held
+      // back. Mark them applied, so that a floor change confirmed after this
+      // undoes them all when it works back to the arrival point.
+      s.drLog = markLogApplied(s.drLog);
       s.relocalizeCount += 1;
       s.lastCorrection = 'Wi-Fi re-localisation (was lost)';
       pushEvent(
@@ -979,6 +1223,8 @@ export function scanQrCode(state, layers) {
       ? state.scannedAnchorIds
       : [...state.scannedAnchorIds, anchor.id],
     lastCorrection: `QR re-scan: ${anchor.label}`,
+    // The cloud is now where the user IS, as after a Wi-Fi re-localisation.
+    drLog: markLogApplied(state.drLog),
     flash: { text: `QR scanned — position corrected (${anchor.label})`, t: state.t },
     events: state.events,
   };
@@ -1007,6 +1253,7 @@ export function setManualPosition(state, point, level) {
     floorConfidence: summary.floorConfidence,
     modeShare: summary.modeShare,
     lastCorrection: 'Manual selection by user',
+    drLog: markLogApplied(state.drLog),
     flash: { text: 'Position set manually', t: state.t },
     events: state.events,
   };
@@ -1014,6 +1261,15 @@ export function setManualPosition(state, point, level) {
   s.wrongFloor = s.est.level !== s.truth.level;
   pushEvent(s, 'manual', 'User tapped their own position');
   return s;
+}
+
+/**
+ * After the cloud is rebuilt at the user's CURRENT position (Wi-Fi
+ * re-localisation, QR scan, manual tap), every logged step is reflected in it,
+ * including steps the barometer gate held back.
+ */
+function markLogApplied(log) {
+  return (log ?? []).map((e) => (e.applied === false ? { ...e, applied: true } : e));
 }
 
 /** Add a point to a trail, skipping points too close to the last one. */

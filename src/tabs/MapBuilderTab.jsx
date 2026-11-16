@@ -6,12 +6,14 @@ import {
   findRoute,
   splitRouteByLevel,
   describeTransports,
+  routeInstructions,
+  ROUTE_PROFILES,
   WALK_SPEED_MPS,
 } from '../lib/navGraph.js';
 import { dist } from '../floorplan/geometry.js';
 import FloorPlanSvg from '../components/FloorPlanSvg.jsx';
 import ExplainerPanel from '../components/ExplainerPanel.jsx';
-import { Panel, Button, Toggle, Stat, Select, Badge, EvidenceStrip } from '../components/ui.jsx';
+import { Panel, Button, Stat, Select, Badge, EvidenceStrip } from '../components/ui.jsx';
 
 /**
  * TAB 1 — Auto Map Builder
@@ -19,9 +21,29 @@ import { Panel, Button, Toggle, Stat, Select, Badge, EvidenceStrip } from '../co
  * Demonstrates that a building can be turned into a routable map automatically
  * rather than traced by hand. Press "Generate navigation graph" and the graph is
  * derived from the floor plan geometry in a couple of milliseconds, then A*
- * routes across it — including between levels, and including an accessible-only
- * mode that refuses stairs and escalators.
+ * routes across it — across any number of floors, under a route profile
+ * (fastest / step-free / avoid escalators), around connectors the presenter has
+ * marked out of service, and with step-by-step directions.
  */
+
+/**
+ * Who each route profile is for, and what it gives up. The RULE lives in
+ * ROUTE_PROFILES (navGraph.js); this is only the sentence a visitor reads.
+ */
+const PROFILE_COPY = {
+  fastest: {
+    who: 'Most shoppers — any escalator, stairs or lift that is in service.',
+    excludes: 'nothing',
+  },
+  'step-free': {
+    who: 'Wheelchairs, prams and heavy luggage — never a step, so lifts only.',
+    excludes: 'stairs and escalators have steps',
+  },
+  'avoid-escalators': {
+    who: 'Shopping trolleys, buggies and very young children — lifts and stairs only.',
+    excludes: 'escalators are unsafe with wheels or small children',
+  },
+};
 
 /** Human's estimated time to trace one floor by hand, in minutes. */
 const MANUAL_MINUTES_PER_FLOOR = 35;
@@ -40,7 +62,9 @@ export default function MapBuilderTab({ presentationMode = false }) {
   const [levelNo, setLevelNo] = useState(1);
   const [startId, setStartId] = useState('');
   const [destId, setDestId] = useState('');
-  const [accessibleOnly, setAccessibleOnly] = useState(false);
+  const [profile, setProfile] = useState('fastest');
+  /** Connector ids the presenter has marked out of service (e.g. lift under repair). */
+  const [outOfService, setOutOfService] = useState(() => new Set());
   const [pickTarget, setPickTarget] = useState('start');
   const [inspectStage, setInspectStage] = useState('input');
   const rafRef = useRef(null);
@@ -49,6 +73,31 @@ export default function MapBuilderTab({ presentationMode = false }) {
   const currentLevels = scenario === 'mall' ? LEVELS : ALTERNATE_LEVELS;
   const currentLinks = scenario === 'mall' ? VERTICAL_LINKS : ALTERNATE_VERTICAL_LINKS;
   const level = currentLevels.find((l) => l.level === levelNo) ?? currentLevels[0];
+  const disabledConnectors = useMemo(() => [...outOfService], [outOfService]);
+
+  // Level names come from the CURRENT scenario's data, never a hard-coded
+  // "Level N": level identifiers are not floor names (the car park is level 0
+  // but is called "Level P"), and the annex has a name of its own.
+  const levelName = useCallback(
+    (l) => currentLevels.find((x) => x.level === l)?.name ?? `Floor ${l}`,
+    [currentLevels],
+  );
+  const levelShort = useCallback(
+    (l) => {
+      const found = currentLevels.find((x) => x.level === l);
+      return found?.shortName ?? found?.name ?? `Floor ${l}`;
+    },
+    [currentLevels],
+  );
+
+  const toggleConnector = useCallback((id) => {
+    setOutOfService((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
 
   // ---- Graph generation ---------------------------------------------------
   /**
@@ -102,7 +151,8 @@ export default function MapBuilderTab({ presentationMode = false }) {
     setLevelNo(1);
     setStartId('');
     setDestId('');
-    setAccessibleOnly(false);
+    setProfile('fastest');
+    setOutOfService(new Set());
   }, []);
 
   // ---- Reveal animation ---------------------------------------------------
@@ -160,10 +210,12 @@ export default function MapBuilderTab({ presentationMode = false }) {
   }, [graph]);
 
   // ---- Routing ------------------------------------------------------------
+  const routable = !!graph && !!startId && !!destId && startId !== destId;
+
   const route = useMemo(() => {
-    if (!graph || !startId || !destId || startId === destId) return null;
-    return findRoute(graph, startId, destId, { accessibleOnly });
-  }, [graph, startId, destId, accessibleOnly]);
+    if (!routable) return null;
+    return findRoute(graph, startId, destId, { profile, disabledConnectors });
+  }, [routable, graph, startId, destId, profile, disabledConnectors]);
 
   /** The route split into one polyline per level, for per-floor drawing. */
   const routeRuns = useMemo(
@@ -171,11 +223,47 @@ export default function MapBuilderTab({ presentationMode = false }) {
     [graph, route],
   );
 
-  /** The unaccessible-mode comparison, so we can quantify the detour cost. */
-  const defaultRoute = useMemo(() => {
-    if (!graph || !startId || !destId || startId === destId) return null;
-    return findRoute(graph, startId, destId, { accessibleOnly: false });
-  }, [graph, startId, destId]);
+  /**
+   * The fastest route under the SAME outages, so a restrictive profile's cost
+   * is quantified against what this visitor could otherwise do today — an
+   * honest trade-off, not a hidden one.
+   */
+  const fastestRoute = useMemo(() => {
+    if (!routable || profile === 'fastest') return null;
+    return findRoute(graph, startId, destId, { profile: 'fastest', disabledConnectors });
+  }, [routable, graph, startId, destId, profile, disabledConnectors]);
+
+  /** The same profile with everything in service, to quantify what an outage costs. */
+  const allInServiceRoute = useMemo(() => {
+    if (!routable || disabledConnectors.length === 0) return null;
+    return findRoute(graph, startId, destId, { profile });
+  }, [routable, graph, startId, destId, profile, disabledConnectors]);
+
+  /** Numbered directions, with each ride paired to the connector it uses. */
+  const steps = useMemo(() => {
+    if (!graph || !route) return [];
+    const list = routeInstructions(graph, route, levelName);
+    // routeInstructions emits ride steps in route order, one per transport, so
+    // the n-th ride step IS route.transports[n]. That pairing is what lets the
+    // list split a ride's time into "wait" and "travel" honestly.
+    let ride = 0;
+    return list.map((s) => (s.kind === 'ride' ? { ...s, transport: route.transports[ride++] } : s));
+  }, [graph, route, levelName]);
+
+  /** Why there is no route — computed from counterfactual searches, never guessed. */
+  const noRouteReason = useMemo(() => {
+    if (!routable || route) return null;
+    return diagnoseNoRoute({
+      graph,
+      connectors: currentLinks,
+      startId,
+      destId,
+      profile,
+      disabled: disabledConnectors,
+      levelName,
+      levelShort,
+    });
+  }, [routable, route, graph, currentLinks, startId, destId, profile, disabledConnectors, levelName, levelShort]);
 
   // ---- Click-to-pick ------------------------------------------------------
   /** Clicking the map selects the nearest shop door on the visible level. */
@@ -333,6 +421,7 @@ export default function MapBuilderTab({ presentationMode = false }) {
             onPointClick={graph ? handleMapClick : undefined}
             cursor={graph ? 'crosshair' : 'default'}
             dimShops={!!graph}
+            disabledConnectorIds={disabledConnectors}
           >
             {graph && inspectStage !== 'input' && (
               <g style={{ pointerEvents: 'none' }}>
@@ -408,8 +497,11 @@ export default function MapBuilderTab({ presentationMode = false }) {
                 </g>
 
                 {/* --- Computed route --- */}
-                {inspectStage === 'route' && accessibleOnly && defaultRoute &&
-                  splitRouteByLevel(graph, defaultRoute)
+                {/* Grey dashed: the fastest route, shown under a restrictive
+                    profile so the detour it forces is visible, not just stated. */}
+                {inspectStage === 'route' && route && fastestRoute &&
+                  !sameRoute(route, fastestRoute) &&
+                  splitRouteByLevel(graph, fastestRoute)
                     .filter((run) => run.level === levelNo)
                     .map((run, i) => (
                       <polyline
@@ -517,11 +609,12 @@ export default function MapBuilderTab({ presentationMode = false }) {
       <div className="space-y-4">
         <ExplainerPanel
           title="Auto Map Builder — what am I looking at?"
-          whatThisIs="A mall floor plan being turned into a routable navigation graph automatically, then routed across with A*."
+          whatThisIs="A multi-floor mall plan being turned into a routable navigation graph automatically, then routed across with A* — between any two floors, under a route profile, around broken connectors."
           concept={[
             'Before an app can give you directions inside a building, the building has to become a graph: nodes are decision points (corridor junctions, corridor ends, shop doors) and edges are walkable connections between them, each labelled with its real length in metres.',
             'Today that graph is traced by hand — someone opens the architect’s drawing and clicks out every corridor and doorway, roughly 30–40 minutes per floor, redone whenever a tenant moves. This tab derives the same graph from the floor plan’s geometry in a few milliseconds.',
-            'Once the graph exists, finding a route is a solved problem: A* explores the graph outward from your start, always expanding the option with the lowest (distance walked + straight-line distance still to go), which guarantees the shortest path.',
+            'Once the graph exists, finding a route is a solved problem: A* explores the graph outward from your start, always expanding the option with the lowest (cost so far + optimistic estimate of cost still to go), which guarantees the cheapest path.',
+            'Floors are joined by connectors — escalators, stairs, the lift — each with a ride time (the lift’s includes a wait for the car), converted into the same units as walking. Escalators are one-way edges. A route profile removes the connectors a visitor cannot use, and an out-of-service connector is removed outright. If nothing is left that links two floors, the app says exactly why instead of quietly sending you somewhere you asked to avoid.',
           ]}
           defaultOpen={!presentationMode}
           legend={[
@@ -571,14 +664,26 @@ export default function MapBuilderTab({ presentationMode = false }) {
             {
               kind: 'dot',
               color: '#0891b2',
-              label: 'Vertical link node',
-              desc: 'escalator, stairs or lift — these stitch Level 1 and Level 2 into one graph',
+              label: 'Connector node',
+              desc: 'where an escalator, stairs or lift stops on this floor. Each connector is joined to its own stop on every other floor it serves, so any number of floors become one graph',
             },
             {
               kind: 'line',
               color: '#2563eb',
               label: 'Computed route',
-              desc: 'the shortest path A* found across the generated graph',
+              desc: 'the best path A* found under the chosen route profile, avoiding out-of-service connectors',
+            },
+            {
+              kind: 'dashed',
+              color: '#94a3b8',
+              label: 'Fastest route (comparison)',
+              desc: 'shown only when a step-free or avoid-escalators profile forces a different path, so the detour is visible',
+            },
+            {
+              kind: 'ring',
+              color: '#2563eb',
+              label: 'Floor hand-off tag',
+              desc: 'dashed blue ring and tag on a connector the route uses: "→ L2" where you board, "Arrived from L1" where you get off',
             },
             {
               kind: 'halo',
@@ -597,8 +702,35 @@ export default function MapBuilderTab({ presentationMode = false }) {
               glyph: '⊞',
               color: '#1d4ed8',
               color2: '#dbeafe',
-              label: 'Lift (accessible)',
-              desc: 'blue outline = step-free. The escalator and stairs are grey because they are not',
+              label: 'Lift (step-free)',
+              desc: 'blue = step-free, the only connector a step-free route may use. It stops on every floor',
+            },
+            {
+              kind: 'glyph',
+              glyph: '↑',
+              color: '#334155',
+              label: 'Up-escalator ("Esc ↑")',
+              desc: 'one-way, from the floor below to the floor above. The arrow is its direction of travel between floors, not a compass direction',
+            },
+            {
+              kind: 'glyph',
+              glyph: '↓',
+              color: '#334155',
+              label: 'Down-escalator ("Esc ↓")',
+              desc: 'its one-way partner beside it; routing never sends anyone up it',
+            },
+            {
+              kind: 'glyph',
+              glyph: '⌃',
+              color: '#334155',
+              label: 'Stairs',
+              desc: 'two-way and reach every floor including the car park, but have steps',
+            },
+            {
+              kind: 'cross',
+              color: '#dc2626',
+              label: 'Out-of-service connector',
+              desc: 'red cross, dashed outline and struck-through caption — marked out of service in the Route panel, so routing will not use it',
             },
           ]}
           whyItMatters="Once a venue has structured geometry, MallNav can derive routing data consistently instead of hand-placing every junction, doorway, and edge for every floor."
@@ -624,19 +756,103 @@ export default function MapBuilderTab({ presentationMode = false }) {
                 {renderDoorOptions(graph, currentLevels)}
               </Select>
 
-              <div className="border-t border-line pt-3">
-                <Toggle
-                  checked={accessibleOnly}
-                  onChange={setAccessibleOnly}
-                  label="Step-free route only"
-                  disabled={currentLinks.length === 0}
-                  hint={
-                    currentLinks.length
-                      ? 'Removes stairs and escalator edges from the graph, forcing the lift. For wheelchairs, prams and luggage.'
-                      : 'This one-level annex has no vertical transport to filter.'
-                  }
-                />
-              </div>
+              {/* ---- Route profile ---- */}
+              <fieldset className="border-t border-line pt-3">
+                <legend className="mb-1.5 text-xs font-medium text-ink">Route profile</legend>
+                <div className="space-y-1.5" role="radiogroup" aria-label="Route profile">
+                  {Object.entries(ROUTE_PROFILES).map(([key, def]) => {
+                    const selected = profile === key;
+                    const allowed = currentLinks.filter((c) => profileAllowsConnector(graph, key, c.id));
+                    // With no connectors at all (the one-level annex) every
+                    // profile gives the identical route, so offering a choice
+                    // would suggest a difference that does not exist.
+                    const disabled = currentLinks.length === 0 && key !== 'fastest';
+                    return (
+                      <button
+                        key={key}
+                        type="button"
+                        role="radio"
+                        aria-checked={selected}
+                        disabled={disabled}
+                        onClick={() => setProfile(key)}
+                        title={`Route using the ${def.label} profile`}
+                        className={`block w-full rounded-lg border px-2.5 py-1.5 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                          selected
+                            ? 'border-brand/50 bg-blue-50'
+                            : 'border-line hover:bg-canvas'
+                        }`}
+                      >
+                        <span className="flex items-center justify-between gap-2">
+                          <span className={`text-xs font-semibold ${selected ? 'text-blue-900' : 'text-ink'}`}>
+                            {def.label}
+                          </span>
+                          {currentLinks.length > 0 && (
+                            <span className="text-[10px] text-ink-faint">
+                              may use: {allowed.length ? allowed.map((c) => c.shortLabel ?? c.label).join(', ') : 'no connector'}
+                            </span>
+                          )}
+                        </span>
+                        <span className="mt-0.5 block text-[11px] leading-snug text-ink-soft">
+                          {PROFILE_COPY[key]?.who ?? ''}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+                {currentLinks.length === 0 && (
+                  <p className="mt-1.5 text-[11px] leading-snug text-ink-faint">
+                    This one-level annex has no escalators, stairs or lifts, so every profile gives
+                    the same route.
+                  </p>
+                )}
+              </fieldset>
+
+              {/* ---- Connector status ---- */}
+              {currentLinks.length > 0 && (
+                <div className="border-t border-line pt-3">
+                  <div className="text-xs font-medium text-ink">Connector status</div>
+                  <p className="mt-0.5 text-[11px] leading-snug text-ink-soft">
+                    Mark a connector out of service (a lift under repair, a stopped escalator).
+                    Routing drops it at query time — the graph is not rebuilt.
+                  </p>
+                  <ul className="mt-2 space-y-1">
+                    {currentLinks.map((c) => {
+                      const isOut = outOfService.has(c.id);
+                      return (
+                        <li
+                          key={c.id}
+                          className={`flex items-center justify-between gap-2 rounded-lg border px-2.5 py-1.5 ${
+                            isOut ? 'border-red-200 bg-red-50/60' : 'border-line'
+                          }`}
+                        >
+                          <span className="min-w-0">
+                            <span
+                              className={`block text-xs font-medium ${isOut ? 'text-bad line-through' : 'text-ink'}`}
+                            >
+                              {c.label}
+                            </span>
+                            <span className="block text-[10px] text-ink-faint">
+                              {describeService(c, graph, levelShort)} · {c.accessible ? 'step-free' : 'steps'}
+                            </span>
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => toggleConnector(c.id)}
+                            aria-pressed={isOut}
+                            className={`shrink-0 rounded-md border px-2 py-1 text-[11px] font-medium transition-colors ${
+                              isOut
+                                ? 'border-red-300 bg-white text-bad hover:bg-red-50'
+                                : 'border-line bg-white text-ink-soft hover:text-ink'
+                            }`}
+                          >
+                            {isOut ? 'Return to service' : 'Mark out of service'}
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </div>
+              )}
 
               {startId === destId ? (
                 <p className="text-xs text-ink-soft">
@@ -664,57 +880,91 @@ export default function MapBuilderTab({ presentationMode = false }) {
                     <div className="mt-0.5 text-xs font-medium text-ink">
                       {describeTransports(route, levelShort)}
                     </div>
-                    {/* Quantify what accessibility costs — an honest trade-off,
+                    {/* Quantify what the profile costs against the fastest
+                        route under the same outages — an honest trade-off,
                         not a hidden one. */}
-                    {accessibleOnly && defaultRoute && (
+                    {fastestRoute && (
                       <div className="mt-1.5 text-[11px] leading-snug text-ink-soft">
-                        Step-free detour adds{' '}
-                        <strong className="tnum text-ink">
-                          {(route.distanceM - defaultRoute.distanceM).toFixed(1)} m
-                        </strong>{' '}
-                        and{' '}
-                        <strong className="tnum text-ink">
-                          {Math.round(route.seconds - defaultRoute.seconds)} s
-                        </strong>{' '}
-                        vs the fastest route ({describeTransports(defaultRoute, levelShort)}).
+                        {sameRoute(route, fastestRoute) ? (
+                          <>
+                            Here the {ROUTE_PROFILES[profile].label.toLowerCase()} route is also the
+                            fastest route — this profile costs nothing on this trip.
+                          </>
+                        ) : (
+                          <>
+                            {ROUTE_PROFILES[profile].label} costs{' '}
+                            <CostDelta route={route} reference={fastestRoute} /> vs the fastest
+                            route ({describeTransports(fastestRoute, levelShort)}).
+                          </>
+                        )}
+                      </div>
+                    )}
+                    {/* And what the outage costs, against the same profile with
+                        everything running. */}
+                    {allInServiceRoute && !sameRoute(route, allInServiceRoute) && (
+                      <div className="mt-1.5 text-[11px] leading-snug text-ink-soft">
+                        {disabledConnectors.length === 1 ? 'The outage costs' : 'The outages cost'}{' '}
+                        <CostDelta route={route} reference={allInServiceRoute} /> vs this profile
+                        with everything in service ({describeTransports(allInServiceRoute, levelShort)}).
                       </div>
                     )}
                   </div>
 
-                  {/* Per-level breakdown, clickable to switch floors. */}
-                  {routeRuns.length > 1 && (
-                    <div className="space-y-1.5">
+                  {/* Step-by-step directions; a step switches the map to its floor. */}
+                  {steps.length > 0 && (
+                    <div>
                       <div className="text-[10px] font-bold uppercase tracking-[0.08em] text-ink-faint">
-                        Route by level
+                        Directions
                       </div>
-                      {routeRuns.map((run, i) => (
-                        <button
-                          key={i}
-                          type="button"
-                          onClick={() => setLevelNo(run.level)}
-                          className={`flex w-full items-center justify-between rounded-lg border px-2.5 py-1.5 text-left text-xs transition-colors ${
-                            run.level === levelNo
-                              ? 'border-brand/40 bg-blue-50 text-blue-900'
-                              : 'border-line text-ink-soft hover:bg-canvas'
-                          }`}
-                        >
-                          <span>
-                            Leg {i + 1} — {levelShort(run.level)}
-                          </span>
-                          <span className="tnum">
-                            {runLength(run.points).toFixed(1)} m
-                            {run.level !== levelNo && ' · view'}
-                          </span>
-                        </button>
-                      ))}
+                      <p className="mt-0.5 text-[11px] text-ink-faint">
+                        Click a step to show its floor on the map.
+                      </p>
+                      <ol className="mt-1.5 space-y-1">
+                        {steps.map((step, i) => (
+                          <li key={i}>
+                            <button
+                              type="button"
+                              onClick={() => setLevelNo(step.level)}
+                              title={`Show ${levelName(step.level)} on the map`}
+                              className={`flex w-full items-start gap-2 rounded-lg border px-2.5 py-1.5 text-left text-xs transition-colors ${
+                                step.level === levelNo
+                                  ? 'border-brand/40 bg-blue-50 text-blue-900'
+                                  : 'border-line text-ink-soft hover:bg-canvas'
+                              }`}
+                            >
+                              <span
+                                className={`tnum mt-px flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[10px] font-bold ${
+                                  step.kind === 'ride' ? 'bg-cyan-700 text-white' : 'bg-brand text-white'
+                                }`}
+                              >
+                                {i + 1}
+                              </span>
+                              <span className="min-w-0 flex-1">
+                                <span className="block font-medium">{step.text}</span>
+                                <span className="tnum block text-[11px] text-ink-faint">
+                                  {step.kind === 'walk'
+                                    ? `${step.metres.toFixed(1)} m · ${formatDuration(step.seconds)} at ${WALK_SPEED_MPS} m/s`
+                                    : describeRideTime(step, currentLinks)}
+                                </span>
+                              </span>
+                            </button>
+                          </li>
+                        ))}
+                      </ol>
                     </div>
                   )}
                 </>
               ) : (
-                <p className="text-xs text-bad">
-                  No route found. With step-free mode on, this can happen if the only connection
-                  between levels is stairs.
-                </p>
+                noRouteReason && (
+                  <div className="rounded-lg border border-red-200 bg-red-50/60 px-3 py-2" role="status">
+                    <div className="text-xs font-semibold text-bad">{noRouteReason.headline}</div>
+                    <ul className="mt-1 list-disc space-y-1 pl-4 text-[11px] leading-snug text-ink-soft">
+                      {noRouteReason.reasons.map((r, i) => (
+                        <li key={i}>{r}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )
               )}
             </div>
           )}
@@ -733,16 +983,20 @@ export default function MapBuilderTab({ presentationMode = false }) {
                 hint="sum of all edges"
               />
               <Stat
-                label="Levels linked"
+                label="Floors"
                 value={graph.stats.levelCount}
-                hint={`${currentLinks.length} vertical links`}
+                hint={
+                  graph.stats.levelCount > 1
+                    ? `joined by ${currentLinks.length} connector${currentLinks.length === 1 ? '' : 's'}`
+                    : 'single floor — no connectors'
+                }
               />
             </div>
             {route && (
               <p className="mt-3 text-[11px] leading-snug text-ink-faint">
                 A* examined <strong className="tnum text-ink-soft">{route.visitedCount}</strong> of{' '}
-                {graph.stats.nodeCount} nodes to prove this route is the shortest — the heuristic
-                lets it ignore the rest.
+                {graph.stats.nodeCount} nodes to prove this route is the cheapest under the chosen
+                profile — the heuristic lets it ignore the rest.
               </p>
             )}
             {validation && (
@@ -752,13 +1006,6 @@ export default function MapBuilderTab({ presentationMode = false }) {
                 <ValidationRow ok={validation.allDoorsReachable} label="Every shop door reachable" />
               </div>
             )}
-            <div className="mt-3 flex flex-wrap gap-1.5">
-              {currentLinks.map((v) => (
-                <Badge key={v.id} tone={v.accessible ? 'brand' : 'neutral'}>
-                  {v.label} · {v.accessible ? 'step-free' : 'steps'}
-                </Badge>
-              ))}
-            </div>
           </Panel>
         )}
       </div>
@@ -811,24 +1058,176 @@ function EndpointMarker({ node, kind }) {
   );
 }
 
-/** Total length of a polyline, in metres. */
-function runLength(points) {
-  let total = 0;
-  for (let i = 0; i < points.length - 1; i++) total += dist(points[i], points[i + 1]);
-  return total;
+/** True when two routes follow exactly the same nodes. */
+function sameRoute(a, b) {
+  return a.nodeIds.length === b.nodeIds.length && a.nodeIds.every((id, i) => id === b.nodeIds[i]);
+}
+
+/** "+12.3 m walking and +45 s" — signed, because a detour can walk LESS but take longer. */
+function CostDelta({ route, reference }) {
+  const signed = (v, digits) => `${v >= 0 ? '+' : '−'}${Math.abs(v).toFixed(digits)}`;
+  return (
+    <>
+      <strong className="tnum text-ink">{signed(route.distanceM - reference.distanceM, 1)} m</strong>{' '}
+      walking and{' '}
+      <strong className="tnum text-ink">{signed(route.seconds - reference.seconds, 0)} s</strong>
+    </>
+  );
+}
+
+/**
+ * Does a route profile allow this connector? Asked of the graph's own connector
+ * edge, through the same `allow` rule findRoute uses, so the panel can never
+ * disagree with the router.
+ */
+function profileAllowsConnector(graph, profileKey, connectorId) {
+  const edge = graph.edges.find((e) => e.kind === 'vertical' && e.connectorId === connectorId);
+  return !!edge && !!ROUTE_PROFILES[profileKey]?.allow(edge);
+}
+
+/** "L1 → L2 only" for a one-way escalator, "serves P · L1 · L2" for two-way ones. */
+function describeService(connector, graph, levelShort) {
+  const ordinal = (l) => graph.ordinalByLevel?.get(l) ?? l;
+  const floors = [...(connector.servesLevels ?? [])].sort((p, q) => ordinal(p) - ordinal(q));
+  if (floors.length === 0) return 'serves no floor';
+  const lowest = levelShort(floors[0]);
+  const highest = levelShort(floors[floors.length - 1]);
+  if (connector.direction === 'up') return `${lowest} → ${highest} only`;
+  if (connector.direction === 'down') return `${highest} → ${lowest} only`;
+  return `serves ${floors.map(levelShort).join(' · ')}`;
+}
+
+/** "55 s = 35 s wait + 2 floors × 10 s" — the ride time, shown as it is derived. */
+function describeRideTime(step, connectors) {
+  const t = step.transport;
+  const c = t && connectors.find((x) => x.id === t.connectorId);
+  if (!c || !t.floors) return formatDuration(step.seconds);
+  const travel = `${t.floors} floor${t.floors === 1 ? '' : 's'} × ${c.secondsPerFloor} s`;
+  return `${formatDuration(step.seconds)} = ${c.waitS ? `${c.waitS} s wait + ` : ''}${travel}`;
+}
+
+/** "A", "A and B", "A, B and C". */
+function listNames(names, conj = 'and') {
+  if (names.length <= 1) return names.join('');
+  return `${names.slice(0, -1).join(', ')} ${conj} ${names[names.length - 1]}`;
+}
+
+/**
+ * Explain why findRoute returned null — by asking the router counterfactual
+ * questions, never by guessing from the settings. Every sentence is backed by
+ * a search that was actually run:
+ *
+ *  - Would this profile find a route if everything were in service? If yes,
+ *    the outage is the cause; if no, the profile itself cannot link the floors.
+ *  - Which out-of-service connector, returned to service on its own, restores
+ *    a route? (And for those that would not, the concrete reason.)
+ *  - Does another profile route right now? That is OFFERED, never applied: a
+ *    wheelchair user who asked for step-free must not be quietly sent to stairs.
+ *
+ * Costs a handful of extra A* searches, only on the rare no-route path.
+ */
+function diagnoseNoRoute({ graph, connectors, startId, destId, profile, disabled, levelName, levelShort }) {
+  const start = graph.nodeById.get(startId);
+  const dest = graph.nodeById.get(destId);
+  const label = ROUTE_PROFILES[profile]?.label ?? profile;
+  const tryRoute = (p, off) => findRoute(graph, startId, destId, { profile: p, disabledConnectors: off });
+  const reasons = [];
+
+  if (start.level === dest.level) {
+    // A same-floor trip needs no connector, so neither the profile nor an
+    // outage can be the cause: the plan itself has no walkable link.
+    return {
+      headline: `No walkable path between ${start.label} and ${dest.label} on ${levelName(start.level)}.`,
+      reasons: ['The floor plan has no corridor connection between these doors; no route profile or connector setting can change that.'],
+    };
+  }
+
+  const headline = `No route from ${levelName(start.level)} to ${levelName(dest.level)} under the “${label}” profile.`;
+  const allowed = connectors.filter((c) => profileAllowsConnector(graph, profile, c.id));
+  const off = new Set(disabled);
+
+  if (profile !== 'fastest') {
+    reasons.push(
+      allowed.length
+        ? `The “${label}” profile may use only the ${listNames(allowed.map((c) => c.label))} — ${PROFILE_COPY[profile]?.excludes ?? 'the others are excluded'}.`
+        : `The “${label}” profile may not use any connector in this building.`,
+    );
+  }
+
+  if (tryRoute(profile, [])) {
+    // The profile CAN link these floors, so it is the outage that breaks it.
+    const relevant = allowed.filter((c) => off.has(c.id));
+    const running = allowed.filter((c) => !off.has(c.id));
+    const names = relevant.map((c) => c.label);
+    if (running.length === 0) {
+      reasons.push(
+        profile === 'fastest'
+          ? `Every connector in the building is out of service (${listNames(names)}).`
+          : relevant.length === 1
+            ? `The ${names[0]} is out of service.`
+            : `All of them are out of service (${listNames(names)}).`,
+      );
+    } else {
+      reasons.push(
+        `Out of service: ${listNames(names)}. The connector${running.length === 1 ? '' : 's'} still running (${listNames(running.map((c) => c.label))}) cannot link these floors for this trip on ${running.length === 1 ? 'its' : 'their'} own.`,
+      );
+    }
+
+    const restorers = relevant.filter((c) => tryRoute(profile, disabled.filter((id) => id !== c.id)));
+    if (restorers.length > 0) {
+      reasons.push(
+        restorers.length === 1
+          ? `Returning the ${restorers[0].label} to service would restore a route.`
+          : `Returning any one of the ${listNames(restorers.map((c) => c.label), 'or')} to service would restore a route.`,
+      );
+      for (const c of relevant.filter((x) => !restorers.includes(x))) {
+        reasons.push(`The ${c.label} alone would not help — ${whyNotAlone(c, start, dest, graph, levelName)}.`);
+      }
+    } else if (relevant.length > 1) {
+      reasons.push('No single one of them returned to service would be enough — together they cut these floors apart.');
+    }
+  } else {
+    reasons.push(
+      profile === 'fastest'
+        ? 'Even with everything in service, no connector links these floors.'
+        : 'Even with everything in service, none of the connectors it may use links these floors.',
+    );
+  }
+
+  const alternatives = Object.keys(ROUTE_PROFILES)
+    .filter((k) => k !== profile)
+    .map((k) => ({ k, r: tryRoute(k, disabled) }))
+    .filter(({ r }) => r);
+  if (alternatives.length) {
+    const offers = alternatives.map(
+      ({ k, r }) => `“${ROUTE_PROFILES[k].label}” (${describeTransports(r, levelShort)}, ${formatDuration(r.seconds)})`,
+    );
+    reasons.push(
+      `A route does exist right now under ${listNames(offers)}, but it uses a connector this profile excludes. MallNav will not switch profiles for you — choose one yourself if that is acceptable.`,
+    );
+  }
+
+  return { headline, reasons };
+}
+
+/** The concrete reason one connector, returned to service alone, would not restore a route. */
+function whyNotAlone(connector, start, dest, graph, levelName) {
+  const serves = connector.servesLevels ?? [];
+  const missing = [start.level, dest.level].filter((l) => !serves.includes(l));
+  if (missing.length) return `it does not stop on ${listNames(missing.map(levelName))}`;
+  const ordinal = (l) => graph.ordinalByLevel?.get(l) ?? l;
+  const tripDir = ordinal(dest.level) > ordinal(start.level) ? 'up' : 'down';
+  if (connector.direction === 'up' || connector.direction === 'down') {
+    if (connector.direction !== tripDir) return `it only runs ${connector.direction}, and this trip goes ${tripDir}`;
+  }
+  return 'it is not enough on its own';
 }
 
 /** "1 min 25 s" style duration. */
-/** Short floor name for markers and summaries ("P", "L1", "L2"). */
-function levelShort(level) {
-  const found = LEVELS.find((l) => l.level === level);
-  return found?.shortName ?? `Level ${level}`;
-}
-
 function formatDuration(seconds) {
   const s = Math.round(seconds);
   if (s < 60) return `${s} s`;
-  return `${Math.floor(s / 60)} min ${s % 60} s`;
+  return s % 60 ? `${Math.floor(s / 60)} min ${s % 60} s` : `${s / 60} min`;
 }
 
 function validateGraph(graph) {
