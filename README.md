@@ -168,6 +168,28 @@ Escalators are one-way: the trip back down uses the down-escalator. A lift ride
 across two floors pays its wait once. The test suite routes all ~2,160 shop pairs
 under every profile and checks A* against Dijkstra on each.
 
+**Tab 1 — floor-plan alignment**
+
+A real mall supplies one drawing per floor, each with its own origin, scale and
+rotation. The alignment panel matches anchors that run through every floor (lift
+shaft, stair core, four structural columns, four building corners; 10 on the car
+park, 12 on Level 2) and solves the least-squares shift, rotation and scale.
+Level 1 is the reference, scaled to metres from its scale bar.
+
+| Measured over 1,000 seeds per floor, clicking noise ±0.15 m | Car park | Level 2 |
+| --- | --- | --- |
+| Worst point anywhere on the floor after alignment | ≤ 0.56 m (median 0.20 m) | ≤ 0.57 m (median 0.19 m) |
+| 6 m mis-click caught (placed on every anchor in turn) | 99.3% | 100% |
+| 2 m mis-click caught | 98.5% | 100% |
+| Correct anchor wrongly rejected | 0.3% | 0.1% |
+
+Mis-clicks are judged leave-one-out, against how well the remaining anchors agree
+among themselves. A plain residual test missed mis-clicks on far-away corners,
+which drag a least-squares fit towards themselves ("masking"), letting a 6 m error
+distort the car park by 2 m. Mis-clicks under ~1.5 m are hard to tell from clicking
+noise and are usually kept, but they then distort the floor by under 0.75 m. A
+wrong rejection costs no accuracy, since 9+ good anchors remain.
+
 **Tab 2 — positioning accuracy** (400 random positions across all three floors)
 
 | Metric | Fingerprinting | Trilateration |
@@ -274,7 +296,7 @@ measuring window.
 
 ## Automated checks
 
-`npm test` runs 38 tests in about 13 s:
+`npm test` runs 46 tests in about 10 s:
 
 - geometry, wall counting and graph connectivity on every floor plan;
 - multi-floor routing across every shop pair and profile: escalator direction,
@@ -284,6 +306,8 @@ measuring window.
   with the right direction and type);
 - end-to-end floor changes on all three walks, the stair-step gate, and a
   barometer-only walk with no QR scan and no Wi-Fi;
+- floor-plan alignment: exact recovery, the 0.6 m bound across seeds, a mis-click
+  on every anchor position, refusal of degenerate input;
 - deterministic radio behaviour, the positioning envelope, AP-calibration recovery,
   and performance guards proving the optimisations changed speed, not results.
 

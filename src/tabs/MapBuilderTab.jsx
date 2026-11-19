@@ -13,6 +13,7 @@ import {
 import { dist } from '../floorplan/geometry.js';
 import FloorPlanSvg from '../components/FloorPlanSvg.jsx';
 import ExplainerPanel from '../components/ExplainerPanel.jsx';
+import FloorAlignmentPanel from '../components/FloorAlignmentPanel.jsx';
 import { Panel, Button, Stat, Select, Badge, EvidenceStrip } from '../components/ui.jsx';
 
 /**
@@ -603,6 +604,10 @@ export default function MapBuilderTab({ presentationMode = false }) {
             )}
           </FloorPlanSvg>
         </div>
+
+        {/* Phase 4: stacking separately supplied floor drawings. Only the
+            multi-floor mall has floors to align; the annex is one level. */}
+        {scenario === 'mall' && <FloorAlignmentPanel />}
       </div>
 
       {/* ================= SIDE COLUMN ================= */}

@@ -11,7 +11,7 @@ merged deliberately.
 | 1 — Routing | ✅ done |
 | 2 — Floor positioning | ✅ done |
 | 3 — UX | ✅ done |
-| 4 — Plan alignment | not started |
+| 4 — Plan alignment | ✅ done (anchors clicked by hand; detecting lift/stair symbols in images is future work) |
 
 Phase 2's open findings were all resolved in the Phase 3 pass: the car-park
 barometer cost (+0.22 m → +0.02 m; root cause an overconfident heading model),
